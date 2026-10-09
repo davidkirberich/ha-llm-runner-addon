@@ -85,6 +85,67 @@ def test_task_detail_run_and_clear_memory(server, storage, monkeypatch):
     assert runner.load_memory("menu") == []
 
 
+STATES = [
+    {"entity_id": "sensor.grid_power", "state": "-1200", "attributes": {"friendly_name": "Grid power", "unit_of_measurement": "W"}},
+    {"entity_id": "sensor.pv_power", "state": "unavailable", "attributes": {"friendly_name": "PV power", "unit_of_measurement": "W"}},
+    {"entity_id": "climate.living_room", "state": "heat", "attributes": {"friendly_name": "Living room", "current_temperature": 21.5}},
+]
+
+
+def test_task_entities_show_current_values(server, storage, monkeypatch):
+    write_tasks(storage, "tasks:\n  energy:\n    entities:\n"
+                         "      grid: sensor.grid_power\n      pv: sensor.pv_power\n      room: climate.living_room:current_temperature\n"
+                         "      gone: sensor.removed\n      cam: http://user:secret@cam.local/snap.jpg\n      cal: calendar.family\n"
+                         "    urls:\n      news: https://example.com/news\n    prompt: x\n")
+    monkeypatch.setattr(runner, "fetch_ha_states", lambda: STATES)
+
+    data = requests.get(server + "api/tasks/energy/entities", timeout=5).json()
+
+    rows = {row["alias"]: row for row in data["entities"]}
+    assert data["error"] is None
+    assert rows["grid"]["name"] == "Grid power" and rows["grid"]["state"] == "-1200" and rows["grid"]["unit"] == "W"
+    assert rows["pv"]["state"] == "unavailable"
+    assert rows["room"]["state"] == 21.5 and rows["room"]["unit"] is None
+    assert rows["gone"]["missing"] is True
+    assert rows["cam"]["kind"] == "camera" and "secret" not in rows["cam"]["target"]
+    assert rows["cal"]["kind"] == "calendar"
+    assert rows["news"]["kind"] == "url" and rows["news"]["section"] == "urls"
+
+
+def test_task_detail_yaml_without_entity_sections(server, storage):
+    write_tasks(storage, "tasks:\n  energy:\n    entities:\n      grid: sensor.grid_power\n    prompt: x\n")
+
+    detail = requests.get(server + "api/tasks/energy", timeout=5).json()
+
+    assert "sensor.grid_power" in detail["config_yaml"]
+    assert "sensor.grid_power" not in detail["settings_yaml"] and "prompt: x" in detail["settings_yaml"]
+
+
+def test_task_entities_report_unreachable_home_assistant(server, storage, monkeypatch):
+    write_tasks(storage, "tasks:\n  energy:\n    entities:\n      grid: sensor.grid_power\n    prompt: x\n")
+
+    def offline():
+        raise requests.ConnectionError("no route")
+    monkeypatch.setattr(runner, "fetch_ha_states", offline)
+
+    response = requests.get(server + "api/tasks/energy/entities", timeout=5)
+
+    assert response.status_code == 200
+    assert "not reachable" in response.json()["error"]
+    assert requests.get(server + "api/entities?q=grid", timeout=5).status_code == 502
+
+
+def test_entity_search_matches_all_words_in_id_and_name(server, monkeypatch):
+    monkeypatch.setattr(runner, "fetch_ha_states", lambda: STATES)
+
+    by_name = requests.get(server + "api/entities?q=GRID%20pow", timeout=5).json()
+    by_domain = requests.get(server + "api/entities?q=sensor", timeout=5).json()
+
+    assert [e["entity_id"] for e in by_name["entities"]] == ["sensor.grid_power"]
+    assert by_name["entities"][0] == {"entity_id": "sensor.grid_power", "name": "Grid power", "state": "-1200", "unit": "W"}
+    assert by_domain["total"] == 2
+
+
 def test_config_validation_reports_yaml_line(server):
     result = send("POST", server + "api/config/validate", {"content": "tasks:\n  a:\n    prompt: [unclosed\n"}).json()
 

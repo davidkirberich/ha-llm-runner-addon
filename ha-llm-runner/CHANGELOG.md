@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Web interface: each task has a **Details** button next to **Run**. It opens the task below the list with the tabs **Details** (last result and prompt), **Memory** and **Config**.
+- **Config** tab: lists the entities, files and URLs a task reads with name and current value from Home Assistant, so typos and `unavailable` sensors stand out. Below it, a search over all Home Assistant entities copies a ready-made `alias: entity_id` line for `llm_tasks.yaml`.
+
+### Changed
+
+- Clicking a task row no longer opens the task; use **Details**.
+
 ## 1.4.1 (2026-10-09)
 
 ### Changed

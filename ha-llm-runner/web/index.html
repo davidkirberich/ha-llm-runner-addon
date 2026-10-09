@@ -66,6 +66,12 @@
   #toast div.error { background: var(--err); color: #fff; }
   .empty { padding: 24px; text-align: center; color: var(--muted); }
   code { font-family: var(--mono); font-size: 12.5px; }
+  .subtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin: 14px 0 4px; }
+  .subtabs button { background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 8px 12px; font: inherit; cursor: pointer; }
+  .subtabs button.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+  .chip.warn { color: var(--warn); }
+  input.search { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); width: min(420px, 100%); }
+  td.mono, span.mono { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -157,7 +163,7 @@
 "use strict";
 // All URLs are relative: Home Assistant serves this page below /api/hassio_ingress/<token>/
 const $ = (id) => document.getElementById(id);
-const state = { tasks: [], selectedTask: null, configDirty: false, procName: null, procDirty: false, auditName: null, pollTimer: null };
+const state = { tasks: [], selectedTask: null, detailTab: "details", configDirty: false, procName: null, procDirty: false, auditName: null, pollTimer: null };
 const BUSY = ["running", "queued"];
 
 function h(tag, attrs, ...children) {
@@ -256,19 +262,20 @@ async function refreshOverview() {
   }
 
   render($("task-rows"), ...data.tasks.map((task) => h("tr", {
-      className: `clickable ${task.id === state.selectedTask ? "selected" : ""}`,
-      onclick: () => selectTask(task.id),
+      className: task.id === state.selectedTask ? "selected" : "",
     },
     h("td", {}, h("div", {}, h("b", {}, task.name)), h("div", { className: "muted" }, task.id,
       task.llm ? ` · ${task.provider || "default provider"}${task.model ? " / " + task.model : ""}` : " · data only")),
     h("td", {}, statusChip(task.status)),
     h("td", { className: "muted" }, formatTime(task.status.finished_at), task.status.duration != null ? ` (${task.status.duration}s)` : ""),
     h("td", { className: "muted" }, String(task.memory_entries)),
-    h("td", { style: "text-align:right" }, h("button", {
-      className: "btn secondary",
-      disabled: BUSY.includes(task.status.state),
-      onclick: (ev) => { ev.stopPropagation(); runTask(task.id); },
-    }, "Run")),
+    h("td", { style: "text-align:right;white-space:nowrap" },
+      h("button", { className: "btn secondary", onclick: () => selectTask(task.id) }, "Details"), " ",
+      h("button", {
+        className: "btn secondary",
+        disabled: BUSY.includes(task.status.state),
+        onclick: () => runTask(task.id),
+      }, "Run")),
   )));
   $("tasks-empty").hidden = data.tasks.length > 0;
 
@@ -300,10 +307,50 @@ $("run-all").addEventListener("click", async () => {
   showTab("tasks");
 });
 
-function selectTask(taskId) {
+async function selectTask(taskId) {
+  const changed = state.selectedTask !== taskId;
   state.selectedTask = taskId;
+  if (changed) state.detailTab = "details";
   document.querySelectorAll("#task-rows tr").forEach((tr, i) => tr.classList.toggle("selected", state.tasks[i] && state.tasks[i].id === taskId));
-  loadTaskDetail(taskId, false);
+  await loadTaskDetail(taskId, false);
+  if (!$("task-detail").hidden) $("task-detail").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// The card is built once per task; polling only refreshes its parts, so the entity search keeps its input
+function taskDetailSkeleton(taskId) {
+  const card = $("task-detail");
+  if (card.dataset.task === taskId) return;
+  card.dataset.task = taskId;
+  const tabs = [["details", "Details"], ["memory", "Memory"], ["config", "Config"]];
+  render(card,
+    h("div", { id: "td-head" }),
+    h("div", { className: "subtabs" }, tabs.map(([name, label]) => h("button", {
+      "data-detail-tab": name, onclick: () => showDetailTab(name),
+    }, label))),
+    h("div", { id: "td-details" }), h("div", { id: "td-memory" }),
+    h("div", { id: "td-config" },
+      h("div", { className: "row", style: "margin-top:12px" },
+        h("h3", { style: "margin:0" }, "Entities"),
+        h("span", { className: "muted" }, "what the task reads, with the current value from Home Assistant"),
+        h("span", { className: "grow" }),
+        h("button", { className: "btn secondary", onclick: () => loadTaskEntities(taskId) }, "Refresh")),
+      h("div", { id: "td-entities", style: "margin-top:8px" }),
+      h("h3", {}, "Find an entity"),
+      h("input", { className: "search", id: "td-search", type: "search", placeholder: "Search by entity ID or name, e.g. power", oninput: searchEntities }),
+      h("p", { className: "muted", style: "margin:6px 0" }, "Copy puts a line like ", h("code", {}, "alias: sensor.example"),
+        " on the clipboard. Paste it into the ", h("code", {}, "entities:"), " section of this task in the llm_tasks.yaml tab and rename the alias as you like."),
+      h("div", { id: "td-search-results" }),
+      h("h3", {}, "Other settings"),
+      h("pre", { id: "td-yaml" })),
+  );
+  state.entitySearchToken = 0;
+}
+
+function showDetailTab(name) {
+  state.detailTab = name;
+  document.querySelectorAll("#task-detail [data-detail-tab]").forEach((b) => b.classList.toggle("active", b.dataset.detailTab === name));
+  ["details", "memory", "config"].forEach((tab) => ($(`td-${tab}`).hidden = tab !== name));
+  if (name === "config" && state.selectedTask) loadTaskEntities(state.selectedTask);
 }
 
 async function loadTaskDetail(taskId, quiet) {
@@ -314,18 +361,22 @@ async function loadTaskDetail(taskId, quiet) {
   const status = data.status;
   const scroll = card.hidden ? null : window.scrollY;
   const limit = data.config.history_limit ?? 7;
-  render(card, 
+  const fresh = card.dataset.task !== taskId;
+  taskDetailSkeleton(taskId);
+  render($("td-head"),
     h("div", { className: "row" },
       h("h2", { style: "margin:0" }, data.config.name || data.id), statusChip(status), h("span", { className: "grow" }),
       h("button", { className: "btn secondary", onclick: () => { state.auditTask = data.id; showTab("audit"); } }, "Audit archives"),
       h("button", { className: "btn", disabled: BUSY.includes(status.state), onclick: () => runTask(data.id) }, "Run now")),
-    status.error ? h("div", { className: "banner error", style: "margin-top:12px" }, status.error) : null,
+    status.error ? h("div", { className: "banner error", style: "margin-top:12px" }, status.error) : null);
+  render($("td-details"),
     h("h3", {}, "Last result", status.finished_at ? h("span", { className: "muted" }, ` · ${formatTime(status.finished_at)}`) : null),
     status.last_result ? h("pre", {}, pretty(status.last_result)) : h("p", { className: "muted" }, "No result since the add-on was started."),
     status.attachments && status.attachments.length ? h("p", { className: "muted" }, `Attachments: ${status.attachments.join(", ")}`) : null,
     h("h3", {}, "Last prompt"),
     status.last_prompt ? h("pre", {}, status.last_prompt)
-      : h("p", { className: "muted" }, data.config.prompt ? "Not run since the add-on was started." : "This task has no prompt (data only)."),
+      : h("p", { className: "muted" }, data.config.prompt ? "Not run since the add-on was started." : "This task has no prompt (data only)."));
+  render($("td-memory"),
     h("div", { className: "row", style: "margin-top:16px" },
       h("h3", { style: "margin:0" }, `Memory · ${data.memory.length} entr${data.memory.length === 1 ? "y" : "ies"}`),
       h("span", { className: "muted" }, `the newest ${limit} are available as {history}`),
@@ -334,12 +385,80 @@ async function loadTaskDetail(taskId, quiet) {
     data.memory.length
       ? h("div", { style: "margin-top:8px" }, data.memory.map((m) => h("div", { className: "memory-entry" },
           h("div", { className: "muted" }, m.time || ""), h("div", { style: "white-space:pre-wrap" }, m.text || ""))))
-      : h("p", { className: "muted" }, "Empty."),
-    h("h3", {}, "Configuration"),
-    h("pre", {}, data.config_yaml),
-  );
+      : h("p", { className: "muted" }, "Empty."));
+  document.querySelector('#task-detail [data-detail-tab="memory"]').textContent = `Memory (${data.memory.length})`;
+  $("td-yaml").textContent = data.settings_yaml;
   card.hidden = false;
+  if (fresh || !quiet) showDetailTab(state.detailTab);
   if (scroll !== null) window.scrollTo(0, scroll);
+}
+
+async function loadTaskEntities(taskId) {
+  const target = $("td-entities");
+  let data;
+  try { data = await api("GET", `api/tasks/${encodeURIComponent(taskId)}/entities`); }
+  catch (e) { render(target, h("div", { className: "banner error" }, e.message)); return; }
+  if (state.selectedTask !== taskId) return;
+  const rows = data.entities;
+  render(target,
+    data.error ? h("div", { className: "banner error" }, data.error) : null,
+    rows.length ? h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Alias"), h("th", {}, "Entity / URL"), h("th", {}, "Name"), h("th", {}, "Current value"))),
+      h("tbody", {}, rows.map((row) => h("tr", {},
+        h("td", { className: "mono" }, h("b", {}, row.alias), row.section !== "entities" ? h("span", { className: "muted" }, ` (${row.section})`) : null),
+        h("td", { className: "mono" }, row.target, row.kind !== "entity" ? [" ", h("span", { className: "chip idle" }, row.kind)] : null),
+        h("td", {}, row.name || ""),
+        h("td", {}, entityValue(row, data.error)),
+      ))))
+      : h("p", { className: "muted" }, "This task reads no entities, files or URLs."));
+}
+
+function entityValue(row, error) {
+  if (!row.entity_id || error) return h("span", { className: "muted" }, row.entity_id ? "–" : "fetched when the task runs");
+  if (row.missing) return h("span", { className: "chip error" }, "not found in Home Assistant");
+  const value = `${row.state ?? ""}${row.unit ? " " + row.unit : ""}`;
+  if (row.state === "unavailable" || row.state === "unknown" || row.state == null) return h("span", { className: "chip warn" }, row.state ?? "no value");
+  return value.length > 120 ? value.slice(0, 120) + "…" : value;
+}
+
+let searchTimer = null;
+function searchEntities() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    const text = $("td-search").value.trim();
+    const target = $("td-search-results");
+    if (text.length < 2) { render(target); return; }
+    const token = ++state.entitySearchToken;
+    let data;
+    try { data = await api("GET", `api/entities?q=${encodeURIComponent(text)}`); }
+    catch (e) { if (token === state.entitySearchToken) render(target, h("div", { className: "banner error" }, e.message)); return; }
+    if (token !== state.entitySearchToken) return;
+    render(target,
+      data.entities.length ? h("table", {}, h("tbody", {}, data.entities.map((e) => h("tr", {},
+        h("td", { className: "mono" }, e.entity_id),
+        h("td", {}, e.name || ""),
+        h("td", { className: "muted" }, `${e.state ?? ""}${e.unit ? " " + e.unit : ""}`),
+        h("td", { style: "text-align:right" }, h("button", { className: "btn secondary", onclick: () => copyEntityLine(e.entity_id) }, "Copy")),
+      )))) : h("p", { className: "muted" }, "No matching entity."),
+      data.total > data.entities.length ? h("p", { className: "muted" }, `${data.total - data.entities.length} more – refine the search.`) : null);
+  }, 300);
+}
+
+async function copyEntityLine(entityId) {
+  const line = `${entityId.split(".").slice(1).join(".")}: ${entityId}`;
+  try {
+    await navigator.clipboard.writeText(line);
+  } catch {
+    // The clipboard API needs HTTPS; plain-HTTP access to Home Assistant falls back to the old way
+    const area = h("textarea", { style: "position:fixed;opacity:0" });
+    area.value = line;
+    document.body.append(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    area.remove();
+    if (!ok) { prompt("Copy this line:", line); return; }
+  }
+  toast(`Copied: ${line}`);
 }
 
 async function clearMemory(taskId) {

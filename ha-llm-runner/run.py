@@ -230,6 +230,13 @@ def fetch_external_url(url: str, max_chars: int = 15000) -> str:
         return f"ERROR: {e}"
 
 
+def fetch_ha_states() -> list[dict]:
+    """All entity states from Home Assistant; raises if Home Assistant cannot be reached."""
+    r = requests.get(f"{HA_URL}/api/states", headers=get_ha_headers(), timeout=10)
+    r.raise_for_status()
+    return r.json() or []
+
+
 def fetch_ha_state(entity_spec: str) -> str:
     entity_id, _, attr = entity_spec.partition(":")
     if not entity_id:

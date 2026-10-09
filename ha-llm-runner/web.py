@@ -12,6 +12,7 @@ import shutil
 import string
 import tarfile
 import threading
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -26,6 +27,9 @@ ALLOWED_CLIENTS = {"172.30.32.2", "127.0.0.1", "::1", "::ffff:127.0.0.1", "::fff
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_INLINE_BYTES = 256 * 1024
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+STATES_CACHE_SECONDS = 10
+MAX_SEARCH_RESULTS = 50
+ENTITY_SECTIONS = ("entities", "files", "urls")
 
 PROCESSOR_NAME = re.compile(r"^[A-Za-z0-9_\-]+\.py$")
 AUDIT_NAME = re.compile(r"^audit_(?P<task>.+)_(?P<stamp>\d{8}_\d{6})\.tar\.gz$")
@@ -48,6 +52,38 @@ class ApiError(Exception):
 
 class BlockDumper(yaml.SafeDumper):
     pass
+
+
+def task_entity_rows(cfg: dict) -> list[dict]:
+    """Everything a task reads (entities, files, urls) with the kind the runner treats it as."""
+    rows = []
+
+    def add(section, alias, target):
+        target = str(target)
+        if target.startswith(("http://", "https://")):
+            kind, entity_id, attribute = ("url" if section == "urls" else "file" if section == "files" else "camera"), None, None
+            # Never show camera or file credentials in the browser
+            target = re.sub(r"//[^/@]+@", "//***@", target)
+        else:
+            entity_id, _, attribute = target.partition(":")
+            domain = entity_id.split(".", 1)[0]
+            kind = domain if domain in ("camera", "calendar") else "entity"
+        rows.append({"section": section, "alias": str(alias), "target": target, "kind": kind,
+                     "entity_id": entity_id, "attribute": attribute or None})
+
+    entities = cfg.get("entities") or {}
+    if isinstance(entities, dict):
+        for alias, target in entities.items():
+            add("entities", alias, target)
+    elif isinstance(entities, list):
+        for index, target in enumerate(entities):
+            add("entities", index, target)
+    for section in ("files", "urls"):
+        values = cfg.get(section) or {}
+        if isinstance(values, dict):
+            for alias, target in values.items():
+                add(section, alias, target)
+    return rows
 
 
 def _represent_str(dumper, value):
@@ -126,6 +162,8 @@ class WebApp:
     def __init__(self, runner):
         self.runner = runner
         self.write_lock = threading.Lock()
+        self.states_lock = threading.Lock()
+        self.states_cache = None
         self.routes = [
             ("GET", r"", self.index),
             ("GET", r"index\.html", self.index),
@@ -134,6 +172,8 @@ class WebApp:
             ("GET", r"api/tasks/(?P<task_id>[^/]+)", self.task_detail),
             ("POST", r"api/tasks/(?P<task_id>[^/]+)/run", self.run_task),
             ("DELETE", r"api/tasks/(?P<task_id>[^/]+)/memory", self.clear_memory),
+            ("GET", r"api/tasks/(?P<task_id>[^/]+)/entities", self.task_entities),
+            ("GET", r"api/entities", self.search_entities),
             ("GET", r"api/config", self.get_config),
             ("PUT", r"api/config", self.save_config),
             ("POST", r"api/config/validate", self.validate_config),
@@ -204,10 +244,12 @@ class WebApp:
 
     def task_detail(self, task_id, **_):
         cfg = self.task_or_404(task_id)
+        settings = {k: v for k, v in cfg.items() if k not in ENTITY_SECTIONS}
         return {
             "id": task_id,
             "config": cfg,
             "config_yaml": yaml.dump({task_id: cfg}, Dumper=BlockDumper, allow_unicode=True, sort_keys=False, width=1000),
+            "settings_yaml": yaml.dump({task_id: settings}, Dumper=BlockDumper, allow_unicode=True, sort_keys=False, width=1000),
             "status": self.runner.task_status(task_id),
             "memory": self.runner.load_memory(task_id),
         }
@@ -225,6 +267,59 @@ class WebApp:
         self.task_or_404(task_id)
         self.runner.clear_memory(task_id)
         return {"cleared": task_id}
+
+    # --- Home Assistant entities ------------------------------------------------------------------
+
+    def ha_states(self) -> dict:
+        """entity_id -> state object, cached briefly so typing in the search does not hammer Home Assistant."""
+        now = time.monotonic()
+        with self.states_lock:
+            if self.states_cache is None or now - self.states_cache[0] > STATES_CACHE_SECONDS:
+                try:
+                    states = self.runner.fetch_ha_states()
+                except Exception as e:
+                    raise ApiError(502, f"Home Assistant is not reachable: {e}")
+                self.states_cache = (now, {s.get("entity_id"): s for s in states if s.get("entity_id")})
+            return self.states_cache[1]
+
+    def task_entities(self, task_id, **_):
+        cfg = self.task_or_404(task_id)
+        rows = task_entity_rows(cfg)
+        error = None
+        states = {}
+        if any(row["entity_id"] for row in rows):
+            try:
+                states = self.ha_states()
+            except ApiError as e:
+                error = e.message
+        for row in rows:
+            if not row["entity_id"] or error:
+                continue
+            state = states.get(row["entity_id"])
+            if state is None:
+                row["missing"] = True
+                continue
+            attributes = state.get("attributes") or {}
+            row["name"] = attributes.get("friendly_name")
+            row["state"] = attributes.get(row["attribute"], state.get("state")) if row["attribute"] else state.get("state")
+            row["unit"] = None if row["attribute"] else attributes.get("unit_of_measurement")
+        return {"entities": rows, "error": error}
+
+    def search_entities(self, query, **_):
+        words = " ".join(query.get("q") or []).lower().split()
+        results = []
+        for entity_id, state in sorted(self.ha_states().items()):
+            attributes = state.get("attributes") or {}
+            name = str(attributes.get("friendly_name") or "")
+            haystack = f"{entity_id} {name}".lower()
+            if all(word in haystack for word in words):
+                results.append({
+                    "entity_id": entity_id,
+                    "name": name,
+                    "state": state.get("state"),
+                    "unit": attributes.get("unit_of_measurement"),
+                })
+        return {"entities": results[:MAX_SEARCH_RESULTS], "total": len(results)}
 
     # --- llm_tasks.yaml ---------------------------------------------------------------------------
 

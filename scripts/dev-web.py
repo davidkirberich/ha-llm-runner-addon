@@ -4,7 +4,8 @@
     python scripts/dev-web.py --port 8199
 
 There is no connection to Home Assistant, MQTT or an LLM: every network connection that does not stay on this
-computer is blocked, and Run only simulates a task (dummy answer after two seconds).
+computer is blocked, Run only simulates a task (dummy answer after two seconds) and the entity search and the
+Config tab of a task show invented entities.
 
 The sample data in .dev-config/ (ignored by git) is recreated on every start, so changes made in the web
 interface are gone after a restart. web.py and web/index.html are loaded fresh on every start as well.
@@ -43,8 +44,10 @@ tasks:
     name: Cat feeder check
     icon: mdi:cat
     entities:
-      feeder_cam: "https://example.com/feeder/snapshot.jpg"
+      feeder_cam: "http://user:password@camera.example.com/snapshot.jpg"
       feeder_weight: sensor.dev_feeder_weight
+    urls:
+      cat_food_tips: "https://example.com/cat-food-tips"
     prompt: |
       Look at the picture of the food bowl. Is there enough food left? The scale shows {feeder_weight} g.
 
@@ -57,8 +60,7 @@ tasks:
     entities:
       door: cover.dev_garage_door
     prompt: |
-      Summarise how often the garage door was opened in the last 12 hours.
-      {data}
+      Summarise how often the garage door was opened in the last 12 hours ({opened_count} changes).
 
   weekly_plan:
     name: Weekly plan
@@ -71,11 +73,11 @@ tasks:
 """
 
 SAMPLE_PROCESSOR = '''\
-"""Example processor: receives the history as a pandas DataFrame and returns the text for {data}."""
+"""Example processor: returns the values for the prompt and the data that is sent along as a table."""
 
 
-def process(df, task_config):
-    return f"{len(df)} values"
+def process(df, config):
+    return {"opened_count": len(df)}, df.reset_index().to_dict("records")
 '''
 
 SAMPLE_MEMORY = {
@@ -89,6 +91,26 @@ SAMPLE_MEMORY = {
 
 # 1x1 pixel PNG, so the audit view has an image to show
 SAMPLE_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+
+# Invented Home Assistant entities for the Config tab of a task and the entity search
+SAMPLE_STATES = [
+    {"entity_id": entity_id, "state": value, "attributes": {"friendly_name": name, **({"unit_of_measurement": unit} if unit else {})}}
+    for entity_id, name, value, unit in [
+        ("sensor.dev_balcony_soil_moisture", "Balcony soil moisture", "41.5", "%"),
+        ("sensor.dev_outdoor_temperature", "Outdoor temperature", "unavailable", "°C"),
+        ("sensor.dev_feeder_weight", "Cat feeder weight", "112", "g"),
+        ("cover.dev_garage_door", "Garage door", "closed", None),
+        ("calendar.dev_family", "Family calendar", "off", None),
+        ("sensor.dev_grid_power", "Grid power", "-1240", "W"),
+        ("sensor.dev_pv_power", "PV power", "3850", "W"),
+        ("sensor.dev_house_power", "House consumption power", "2610", "W"),
+        ("sensor.dev_heat_pump_power", "Heat pump power", "780", "W"),
+        ("sensor.dev_living_room_temperature", "Living room temperature", "21.4", "°C"),
+        ("sensor.dev_living_room_humidity", "Living room humidity", "48", "%"),
+        ("binary_sensor.dev_front_door", "Front door", "off", None),
+        ("weather.dev_home", "Home weather", "partlycloudy", None),
+    ]
+]
 
 
 def block_external_network():
@@ -162,6 +184,7 @@ def main():
         return {"prompt": str(task_config.get("prompt", "")), "result": f"(dev) simulated answer of '{task_id}'"}
 
     runner.execute_task = simulated_task
+    runner.fetch_ha_states = lambda: SAMPLE_STATES
     create_sample_data(runner)
 
     web.start_web_server(runner, host="127.0.0.1", port=args.port)

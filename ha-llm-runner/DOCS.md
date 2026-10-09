@@ -43,7 +43,10 @@ Changes to `llm_tasks.yaml` are picked up on the next run. When you save the fil
 
 The add-on adds **LLM Runner** to the Home Assistant sidebar. It shows:
 
-- **Tasks**: status, duration and errors of the last run, the last result and prompt, and the task's memory (with **Clear memory**). Every task can be run from here, also without an MQTT connection.
+- **Tasks**: status, duration and errors of the last run. Every task can be run from here, also without an MQTT connection. **Details** opens the task below the list with three tabs:
+  - **Details**: the last result and the last prompt.
+  - **Memory**: the task's memory, with **Clear memory**.
+  - **Config**: the entities, files and URLs the task reads, with the name and current value from Home Assistant (missing and `unavailable` entities are marked), and the task's other settings. **Find an entity** searches all Home Assistant entities by ID or name; **Copy** puts a line like `grid_power: sensor.grid_power` on the clipboard to paste into the task's `entities:` in the **llm_tasks.yaml** tab.
 - **llm_tasks.yaml**: an editor with validation. Saving checks the YAML first, warns about unknown keys and missing processors, and keeps the previous version as `llm_tasks.yaml.bak`.
 - **Processors**: create, edit and delete processor scripts. Saving checks the Python syntax.
 - **Audit**: browse, view, download and delete audit archives, including the attached images.

@@ -169,7 +169,7 @@ python -m pytest
 python scripts/dev-web.py
 ```
 
-There is no connection to Home Assistant, MQTT or an LLM: network access beyond your computer is blocked and **Run** only simulates a task (dummy answer after two seconds). The sample data in `.dev-config/` (ignored by git) is recreated on every start, so changes made in the web interface are gone after a restart. Restart the script after changing `web.py` or `web/index.html`. Use `--port` for another port.
+There is no connection to Home Assistant, MQTT or an LLM: network access beyond your computer is blocked, **Run** only simulates a task (dummy answer after two seconds) and the entity search and **Config** tab show invented entities. The sample data in `.dev-config/` (ignored by git) is recreated on every start, so changes made in the web interface are gone after a restart. Restart the script after changing `web.py` or `web/index.html`. Use `--port` for another port.
 
 ### Testing on your own Home Assistant
 
