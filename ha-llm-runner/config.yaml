@@ -14,7 +14,6 @@ map:
 options:
   gemini_api_key: ""
   gemini_model: "gemini-3.5-flash-lite"
-  schedule_cron: "0 6,13,20 * * *"
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_user: ""
@@ -22,7 +21,6 @@ options:
 schema:
   gemini_api_key: password
   gemini_model: str
-  schedule_cron: str
   mqtt_host: str
   mqtt_port: int
   mqtt_user: str

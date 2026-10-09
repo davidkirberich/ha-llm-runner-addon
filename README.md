@@ -24,3 +24,6 @@ A modular Home Assistant Add-on for orchestrating LLM-powered data processing pi
        │
        ▼  (MQTT Discovery + Retain)
 [ Mosquitto Broker ] ────► [ Home Assistant State Machine & Recorder ]
+
+# License
+This project is licensed under the GNU General Public License v3.0.
