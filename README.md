@@ -163,14 +163,13 @@ python -m pytest
 
 ### Testing the web interface on your computer
 
-[`scripts/dev-web.py`](scripts/dev-web.py) starts the web interface locally at <http://localhost:8099>, without Home Assistant, MQTT or LLM calls:
+[`scripts/dev-web.py`](scripts/dev-web.py) starts the web interface locally at <http://localhost:8099> with invented sample tasks, a processor, memory entries and audit archives:
 
 ```powershell
-python scripts/dev-web.py                                # sample llm_tasks.yaml in .dev-config/
-python scripts/dev-web.py --pull homeassistant.local     # copy of the production configuration (via SSH)
+python scripts/dev-web.py
 ```
 
-Files are read from and saved to `.dev-config/` (ignored by git). **Run** only simulates a task: it returns a dummy answer after two seconds and leaves the memory untouched. Restart the script after changing `web.py` or `web/index.html`. With `--live`, tasks really run against Home Assistant and write the real sensors; this needs `SUPERVISOR_URL` (e.g. `http://homeassistant.local:8123`), `HA_TOKEN` (a long-lived access token) and `GEMINI_API_KEY`.
+There is no connection to Home Assistant, MQTT or an LLM: network access beyond your computer is blocked and **Run** only simulates a task (dummy answer after two seconds). The sample data in `.dev-config/` (ignored by git) is recreated on every start, so changes made in the web interface are gone after a restart. Restart the script after changing `web.py` or `web/index.html`. Use `--port` for another port.
 
 ### Testing on your own Home Assistant
 

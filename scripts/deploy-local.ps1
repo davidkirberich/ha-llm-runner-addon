@@ -19,7 +19,7 @@
     -Remove uninstalls the local add-on together with its configuration.
 
 .EXAMPLE
-    .\scripts\deploy-local.ps1 -HostName 192.168.10.5
+    .\scripts\deploy-local.ps1 -HostName 192.168.1.20
 .EXAMPLE
     .\scripts\deploy-local.ps1 -CheckOnly
 .EXAMPLE

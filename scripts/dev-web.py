@@ -1,99 +1,171 @@
-"""Starts the add-on's web interface on this computer, without Home Assistant, MQTT or LLM calls.
+"""Starts the add-on's web interface on this computer with invented sample data.
 
-    python scripts/dev-web.py                       # sample configuration in .dev-config/
-    python scripts/dev-web.py --pull homeassistant.local   # copy of the production configuration
-    python scripts/dev-web.py --live                # real task runs (see below)
+    python scripts/dev-web.py            # then open http://localhost:8099
+    python scripts/dev-web.py --port 8199
 
-Then open http://localhost:8099. Files are read from and saved to --config-dir. web.py and web/index.html
-are loaded fresh on every start, so restart the script after changing them.
+There is no connection to Home Assistant, MQTT or an LLM: every network connection that does not stay on this
+computer is blocked, and Run only simulates a task (dummy answer after two seconds).
 
-By default, Run only simulates a task: it waits two seconds and returns a dummy answer, so nothing is sent to
-Home Assistant or the LLM and the memory stays untouched. With --live, tasks really run: set SUPERVISOR_URL
-(e.g. http://homeassistant.local:8123), HA_TOKEN (a long-lived access token) and GEMINI_API_KEY first. The
-results are then written to the real Home Assistant sensors.
+The sample data in .dev-config/ (ignored by git) is recreated on every start, so changes made in the web
+interface are gone after a restart. web.py and web/index.html are loaded fresh on every start as well.
 """
 import argparse
-import io
+import base64
+import ipaddress
+import json
 import os
 import shutil
-import subprocess
+import socket
 import sys
-import tarfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SAMPLE_TASKS = """tasks:
-  morning_briefing:
-    name: Morning briefing
-    target_sensor: sensor.llm_morning_briefing
-    history_limit: 7
+CONFIG_DIR = os.path.join(REPO, ".dev-config")
+
+SAMPLE_TASKS = """\
+tasks:
+  plant_watering:
+    name: Plant watering advice
+    icon: mdi:sprout
+    target_sensor: sensor.dev_plant_watering
+    history_limit: 5
+    hours: 24
+    resample: 1h
     entities:
-      temperature: sensor.outdoor_temperature
+      soil_moisture: sensor.dev_balcony_soil_moisture
+      outdoor_temperature: sensor.dev_outdoor_temperature
     prompt: |
-      Today is {weekday}, {today}. It is {temperature} degrees outside.
+      Today is {weekday}, {today}. Soil moisture: {soil_moisture} %, outside: {outdoor_temperature} degrees.
+      Should the balcony plants be watered today? One sentence.
       Your last answers: {history}
+
+  cat_feeder:
+    name: Cat feeder check
+    icon: mdi:cat
+    entities:
+      feeder_cam: "https://example.com/feeder/snapshot.jpg"
+      feeder_weight: sensor.dev_feeder_weight
+    prompt: |
+      Look at the picture of the food bowl. Is there enough food left? The scale shows {feeder_weight} g.
+
+  garage_door:
+    name: Garage door summary
+    icon: mdi:garage
+    target_sensor: sensor.dev_garage_summary
+    hours: 12
+    data_processor: example_processor
+    entities:
+      door: cover.dev_garage_door
+    prompt: |
+      Summarise how often the garage door was opened in the last 12 hours.
+      {data}
+
+  weekly_plan:
+    name: Weekly plan
+    icon: mdi:calendar-week
+    entities:
+      calendar: calendar.dev_family
+    prompt: |
+      Write a short overview of the appointments of the coming week.
+      {calendar}
 """
 
+SAMPLE_PROCESSOR = '''\
+"""Example processor: receives the history as a pandas DataFrame and returns the text for {data}."""
 
-def pull(host: str, user: str, target: str):
-    """Copies llm_tasks.yaml, processors/, memory/ and audit/ of the store version via SSH."""
-    remote = (
-        "set -e; cd /app_configs 2>/dev/null || cd /addon_configs; "
-        "d=$(ls -d *_ha_llm_runner | grep -v '^local_' | head -1); [ -n \"$d\" ] || exit 3; "
-        "cd \"$d\"; tar -cz --exclude=__pycache__ $(ls -d llm_tasks.yaml processors memory audit 2>/dev/null)"
-    )
-    print(f"Copying the production configuration from {host} ...", flush=True)
-    result = subprocess.run(["ssh", "-o", "BatchMode=yes", f"{user}@{host}", remote], capture_output=True)
-    if result.returncode != 0:
-        sys.exit(f"Copy failed: {result.stderr.decode(errors='replace').strip() or 'add-on folder not found'}")
-    shutil.rmtree(target, ignore_errors=True)
-    os.makedirs(target)
-    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:gz") as archive:
-        archive.extractall(target, filter="data")
+
+def process(df, task_config):
+    return f"{len(df)} values"
+'''
+
+SAMPLE_MEMORY = {
+    "plant_watering": [
+        "No watering needed today, the soil is still moist.",
+        "Water the plants this evening, it will be hot and dry.",
+        "Light watering in the morning is enough.",
+    ],
+    "garage_door": ["The garage door was opened twice, both times in the morning."],
+}
+
+# 1x1 pixel PNG, so the audit view has an image to show
+SAMPLE_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+
+
+def block_external_network():
+    """Allows connections to this computer only, so nothing can reach Home Assistant, MQTT or an LLM."""
+    original_connect = socket.socket.connect
+
+    def guarded_connect(sock, address):
+        host = address[0] if isinstance(address, tuple) else address
+        try:
+            local = ipaddress.ip_address(str(host).split("%")[0]).is_loopback
+        except ValueError:
+            local = str(host).lower() == "localhost"
+        if not local:
+            raise ConnectionRefusedError(f"dev-web.py: network access to {host} is blocked")
+        return original_connect(sock, address)
+
+    socket.socket.connect = guarded_connect
+    original_getaddrinfo = socket.getaddrinfo
+
+    def guarded_getaddrinfo(host, *args, **kwargs):
+        if host not in (None, "localhost", "127.0.0.1", "::1"):
+            raise socket.gaierror(f"dev-web.py: name lookup of {host} is blocked")
+        return original_getaddrinfo(host, *args, **kwargs)
+
+    socket.getaddrinfo = guarded_getaddrinfo
+
+
+def create_sample_data(runner):
+    shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+    os.makedirs(runner.PROCESSORS_DIR)
+    with open(runner.TASKS_CONFIG_PATH, "w", encoding="utf-8") as f:
+        f.write(SAMPLE_TASKS)
+    with open(os.path.join(runner.PROCESSORS_DIR, "example_processor.py"), "w", encoding="utf-8") as f:
+        f.write(SAMPLE_PROCESSOR)
+    options = {"language": "en", "audit_retention_days": 30, "gemini_model": "dev-model"}
+    with open(runner.OPTIONS_PATH, "w", encoding="utf-8") as f:
+        json.dump(options, f, indent=2)
+
+    for task_id, texts in SAMPLE_MEMORY.items():
+        runner.save_memory(task_id, [{"time": f"0{i + 1}.01.2026 07:00:00", "text": t} for i, t in enumerate(texts)])
+
+    runner.create_audit_archive(
+        "plant_watering", "Today is Monday ... Should the balcony plants be watered today?",
+        "No watering needed today, the soil is still moist.", {"model": "dev-model", "duration_s": 1.2},
+        json.dumps([{"time": "2026-01-05T06:00:00", "soil_moisture": 41.0}]), [], options)
+    runner.create_audit_archive(
+        "cat_feeder", "Look at the picture of the food bowl.", "The bowl is about half full.",
+        {"model": "dev-model", "duration_s": 2.4}, "", [(SAMPLE_IMAGE, "image/png")], options)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config-dir", default=os.path.join(REPO, ".dev-config"), help="default: .dev-config/")
     parser.add_argument("--port", type=int, default=8099)
-    parser.add_argument("--pull", metavar="HOST", help="replace --config-dir with a copy of the production configuration")
-    parser.add_argument("--user", default="root", help="SSH user for --pull (default: root)")
-    parser.add_argument("--live", action="store_true", help="run tasks for real instead of simulating them")
     args = parser.parse_args()
 
-    config_dir = os.path.abspath(args.config_dir)
-    if args.pull:
-        pull(args.pull, args.user, config_dir)
-    os.makedirs(config_dir, exist_ok=True)
-    tasks_path = os.path.join(config_dir, "llm_tasks.yaml")
-    if not os.path.exists(tasks_path):
-        with open(tasks_path, "w", encoding="utf-8") as f:
-            f.write(SAMPLE_TASKS)
-
+    block_external_network()
     sys.path.insert(0, os.path.join(REPO, "ha-llm-runner"))
     import run as runner
     import web
 
-    runner.CONFIG_DIR = config_dir
-    runner.TASKS_CONFIG_PATH = tasks_path
-    runner.PROCESSORS_DIR = os.path.join(config_dir, "processors")
-    runner.MEMORY_DIR = os.path.join(config_dir, "memory")
-    runner.AUDIT_DIR = os.path.join(config_dir, "audit")
-    runner.OPTIONS_PATH = os.path.join(config_dir, "options.json")
+    runner.CONFIG_DIR = CONFIG_DIR
+    runner.TASKS_CONFIG_PATH = os.path.join(CONFIG_DIR, "llm_tasks.yaml")
+    runner.PROCESSORS_DIR = os.path.join(CONFIG_DIR, "processors")
+    runner.MEMORY_DIR = os.path.join(CONFIG_DIR, "memory")
+    runner.AUDIT_DIR = os.path.join(CONFIG_DIR, "audit")
+    runner.OPTIONS_PATH = os.path.join(CONFIG_DIR, "options.json")
+    runner._ha_config = {}
 
-    if not args.live:
-        # No Home Assistant to ask for time zone and language
-        runner._ha_config = {}
+    def simulated_task(task_id, task_config, client, options):
+        time.sleep(2)
+        return {"prompt": str(task_config.get("prompt", "")), "result": f"(dev) simulated answer of '{task_id}'"}
 
-        def simulated_task(task_id, task_config, client, options):
-            time.sleep(2)
-            return {"prompt": str(task_config.get("prompt", "")), "result": f"(dev) simulated answer of '{task_id}'"}
-
-        runner.execute_task = simulated_task
+    runner.execute_task = simulated_task
+    create_sample_data(runner)
 
     web.start_web_server(runner, host="127.0.0.1", port=args.port)
-    mode = "LIVE: tasks really run" if args.live else "task runs are simulated"
-    print(f"Web UI: http://localhost:{args.port}  ({mode}; config: {config_dir}). Stop with Ctrl+C.", flush=True)
+    print(f"Web UI: http://localhost:{args.port}  (sample data, simulated runs). Stop with Ctrl+C.", flush=True)
     try:
         while True:
             time.sleep(3600)
