@@ -169,15 +169,19 @@ python -m pytest
 powershell -ExecutionPolicy Bypass -File .\scripts\deploy-local.ps1 -HostName homeassistant.local
 ```
 
-`-CheckOnly` only tests the connection. The local add-on (slug `local_ha_llm_runner`) has its own config folder. Stop the GitHub-installed version while testing, because both use the same MQTT topics and entities.
+`-CheckOnly` only tests the connection.
 
-To go back to the store version:
+The version installed from the add-on store is treated as production and the local add-on (slug `local_ha_llm_runner`) as staging. On every deploy, the local add-on's configuration is replaced by a fresh copy of the production configuration: `llm_tasks.yaml`, `processors/`, `memory/` and the options, but not `audit/`. Changes made while testing are therefore discarded on the next deploy, and nothing is ever copied back to production.
+
+The local add-on is left stopped after a deploy. Stop the production add-on before you start it, because both use the same MQTT topics and entities.
+
+When you are done testing:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\deploy-local.ps1 -Remove -Transfer
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy-local.ps1 -Remove
 ```
 
-`-Remove` uninstalls the local add-on. `-Transfer` first updates the store version if needed, then copies the local add-on's `llm_tasks.yaml`, `processors/`, `memory/`, `audit/` and options to it. It stops without changing anything if the store version already has an `llm_tasks.yaml`. Without `-Transfer`, the local add-on's config folder is kept.
+This uninstalls the local add-on together with its configuration. Then start the production add-on again.
 
 ---
 
