@@ -8,6 +8,10 @@ import tarfile
 import logging
 import importlib.util
 import mimetypes
+import shutil
+import string
+import threading
+import time
 from urllib.parse import urlparse, unquote
 from datetime import datetime, timezone, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -17,6 +21,8 @@ import requests
 from requests.auth import HTTPDigestAuth
 import pandas as pd
 import paho.mqtt.client as mqtt
+from babel import Locale, UnknownLocaleError
+from babel.dates import format_date, format_skeleton, format_time
 
 from llm_providers import LLMRequest, get_provider
 
@@ -28,15 +34,54 @@ logging.basicConfig(
 logger = logging.getLogger("ha_llm_runner")
 
 OPTIONS_PATH = "/data/options.json"
+# Since 1.4.0: /config is the add-on's own folder (addon_config), Home Assistant's config is mounted at /homeassistant
 CONFIG_DIR = "/config"
-TASKS_CONFIG_PATH = "/config/llm_tasks.yaml"
-PROCESSORS_DIR = "/config/scripts/processors"
+HA_CONFIG_DIR = "/homeassistant"
+TASKS_CONFIG_PATH = os.path.join(CONFIG_DIR, "llm_tasks.yaml")
+PROCESSORS_DIR = os.path.join(CONFIG_DIR, "processors")
+MEMORY_DIR = os.path.join(CONFIG_DIR, "memory")
+AUDIT_DIR = os.path.join(CONFIG_DIR, "audit")
+LEGACY_TASKS_CONFIG_PATH = os.path.join(HA_CONFIG_DIR, "llm_tasks.yaml")
+LEGACY_PROCESSORS_DIR = os.path.join(HA_CONFIG_DIR, "scripts", "processors")
+LEGACY_CONFIG_PREFIX = "/config/"
+MEMORY_SIZE = 30
 
 HA_URL = os.environ.get("SUPERVISOR_URL", "http://supervisor/core")
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 
 DEFAULT_DATETIME_FORMAT = "%d.%m.%Y %H:%M:%S"
-_ha_time_zone: str | None = None
+DEFAULT_LANGUAGE = "en"
+TIMESERIES_PLACEHOLDERS = {"timeseries", "data"}
+_ha_config: dict | None = None
+_mqtt_client = None
+_run_lock = threading.Lock()
+TASK_STATUS: dict[str, dict] = {}
+MQTT_STATUS = {"connected": False}
+
+
+def safe_name(value: str) -> str:
+    """File-system safe version of a task id or entity id."""
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", str(value)) or "_"
+
+
+def legacy_path_candidates(path_value: str) -> list[str]:
+    """Pre-1.4.0 absolute '/config/...' paths pointed into Home Assistant's config folder."""
+    if path_value.startswith(LEGACY_CONFIG_PREFIX):
+        return [os.path.join(HA_CONFIG_DIR, path_value[len(LEGACY_CONFIG_PREFIX):])]
+    return []
+
+
+def is_absolute(path_value: str) -> bool:
+    return path_value.startswith("/") or os.path.isabs(path_value)
+
+
+def resolve_data_path(path_value: str) -> str:
+    """Path of a `files:` entry: absolute, or relative to Home Assistant's config, then to the add-on folder."""
+    if is_absolute(path_value):
+        candidates = [path_value, *legacy_path_candidates(path_value)]
+    else:
+        candidates = [os.path.join(HA_CONFIG_DIR, path_value), os.path.join(CONFIG_DIR, path_value)]
+    return next((c for c in candidates if os.path.isfile(c)), candidates[0])
 
 
 def get_ha_headers() -> dict:
@@ -47,17 +92,26 @@ def get_ha_headers() -> dict:
     return headers
 
 
-def fetch_ha_time_zone() -> str:
-    global _ha_time_zone
-    if _ha_time_zone is None:
+def fetch_ha_config() -> dict:
+    """Home Assistant's /api/config, cached after the first successful read."""
+    global _ha_config
+    if _ha_config is None:
         try:
             r = requests.get(f"{HA_URL}/api/config", headers=get_ha_headers(), timeout=10)
             r.raise_for_status()
-            _ha_time_zone = r.json().get("time_zone") or ""
+            _ha_config = r.json() or {}
         except Exception as e:
-            logger.warning(f"Could not read time zone from Home Assistant: {e}")
-            return ""
-    return _ha_time_zone
+            logger.warning(f"Could not read configuration from Home Assistant: {e}")
+            return {}
+    return _ha_config
+
+
+def fetch_ha_time_zone() -> str:
+    return str(fetch_ha_config().get("time_zone") or "")
+
+
+def fetch_ha_language() -> str:
+    return str(fetch_ha_config().get("language") or "")
 
 
 def get_local_timezone(options: dict | None = None) -> tzinfo:
@@ -83,9 +137,84 @@ def local_now(options: dict | None = None) -> datetime:
     return datetime.now(get_local_timezone(options))
 
 
+def parse_locale(name: str) -> Locale | None:
+    name = str(name or "").strip().replace("_", "-")
+    if not name:
+        return None
+    for candidate in (name, name.split("-", 1)[0]):
+        try:
+            return Locale.parse(candidate, sep="-")
+        except (ValueError, TypeError, UnknownLocaleError):
+            continue
+    return None
+
+
+def get_locale(options: dict | None = None) -> Locale:
+    """Option `language` > Home Assistant's configured language > English."""
+    options = load_options() if options is None else options
+    sources = (
+        ("add-on option 'language'", lambda: options.get("language")),
+        ("Home Assistant config", fetch_ha_language),
+    )
+    for source, read in sources:
+        name = read()
+        if not name:
+            continue
+        locale = parse_locale(name)
+        if locale is not None:
+            return locale
+        logger.warning(f"Ignoring unknown language '{name}' from {source}.")
+    return Locale.parse(DEFAULT_LANGUAGE)
+
+
+def _clean_babel(text: str) -> str:
+    # CLDR uses narrow no-break spaces (e.g. "5:45 PM"), which TTS engines and logs handle poorly
+    return text.replace("\u202f", " ").replace("\u00a0", " ")
+
+
+def localized_strftime(value: datetime, fmt: str, locale: Locale) -> str:
+    """strftime, but day and month names (%A %a %B %b) come from the locale instead of the C locale."""
+    names = {
+        "A": lambda: format_date(value, "EEEE", locale=locale),
+        "a": lambda: format_date(value, "EEE", locale=locale),
+        "B": lambda: format_date(value, "MMMM", locale=locale),
+        "b": lambda: format_date(value, "MMM", locale=locale),
+    }
+
+    def replace(match: re.Match) -> str:
+        code = match.group(1)
+        if code in names:
+            return _clean_babel(names[code]()).replace("%", "%%")
+        return match.group(0)
+
+    return value.strftime(re.sub(r"%(.)", replace, fmt))
+
+
 def format_datetime(value: datetime, options: dict | None = None) -> str:
     options = load_options() if options is None else options
-    return value.strftime(options.get("datetime_format") or DEFAULT_DATETIME_FORMAT)
+    return localized_strftime(value, options.get("datetime_format") or DEFAULT_DATETIME_FORMAT, get_locale(options))
+
+
+def builtin_placeholders(now: datetime, options: dict) -> dict:
+    locale = get_locale(options)
+    return {
+        "weekday": _clean_babel(format_date(now, "EEEE", locale=locale)),
+        "today": _clean_babel(format_skeleton("dMMMM", now, locale=locale)),
+        "date": _clean_babel(format_date(now, "long", locale=locale)),
+        "time": _clean_babel(format_time(now, "short", locale=locale)),
+        "month": _clean_babel(format_date(now, "LLLL", locale=locale)),
+        "year": str(now.year),
+        "now": format_datetime(now, options),
+    }
+
+
+def prompt_fields(prompt: str) -> set[str]:
+    """Top-level placeholder names used in a str.format prompt ({{...}} escapes excluded)."""
+    try:
+        parsed = list(string.Formatter().parse(prompt))
+    except ValueError:
+        return set()
+    return {re.split(r"[.\[]", field, maxsplit=1)[0] for _, field, _, _ in parsed if field}
 
 def fetch_external_url(url: str, max_chars: int = 15000) -> str:
     try:
@@ -206,7 +335,7 @@ def fetch_camera_snapshot(target: str) -> tuple[str, str]:
 
 
 def fetch_binary_file(target: str) -> tuple[str, str]:
-    """Any file (image, audio, video, PDF, ...) from a URL or a local path; absolute or relative to /config."""
+    """Any file (image, audio, video, PDF, ...) from a URL or a local path (see resolve_data_path)."""
     if is_http_url(target):
         url, auth = split_url_credentials(target)
         with requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, auth=auth, stream=True, timeout=20) as r:
@@ -219,7 +348,7 @@ def fetch_binary_file(target: str) -> tuple[str, str]:
             raw_bytes = bytes(buffer)
             mime_type = guess_mime_type(target, r.headers.get("Content-Type", ""))
     else:
-        path = target if os.path.isabs(target) else os.path.join(CONFIG_DIR, target)
+        path = resolve_data_path(target)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
         if os.path.getsize(path) > MAX_FILE_BYTES:
@@ -330,12 +459,28 @@ def process_default(df, resample_rule="1h"):
     return current, timeseries_json
 
 
-def create_audit_archive(task_name: str, prompt: str, verdict: str, metrics: dict, timeseries_data: str, images: list) -> str:
-    audit_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive")
-    os.makedirs(audit_dir, exist_ok=True)
+def prune_audit_archives(retention_days: int) -> int:
+    if retention_days <= 0 or not os.path.isdir(AUDIT_DIR):
+        return 0
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    for name in os.listdir(AUDIT_DIR):
+        path = os.path.join(AUDIT_DIR, name)
+        if name.endswith(".tar.gz") and os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError as e:
+                logger.warning(f"Could not delete old audit archive {name}: {e}")
+    return removed
 
-    timestamp = local_now().strftime("%Y%m%d_%H%M%S")
-    tar_filename = os.path.join(audit_dir, f"audit_{task_name}_{timestamp}.tar.gz")
+
+def create_audit_archive(task_name: str, prompt: str, verdict: str, metrics: dict, timeseries_data: str, images: list, options: dict | None = None) -> str:
+    options = load_options() if options is None else options
+    os.makedirs(AUDIT_DIR, exist_ok=True)
+
+    timestamp = local_now(options).strftime("%Y%m%d_%H%M%S")
+    tar_filename = os.path.join(AUDIT_DIR, f"audit_{safe_name(task_name)}_{timestamp}.tar.gz")
 
     with tarfile.open(tar_filename, "w:gz") as tar:
         prompt_bytes = prompt.encode("utf-8")
@@ -372,6 +517,7 @@ def create_audit_archive(task_name: str, prompt: str, verdict: str, metrics: dic
             info.size = len(img_bytes)
             tar.addfile(info, io.BytesIO(img_bytes))
 
+    prune_audit_archives(int(options.get("audit_retention_days", 30) or 0))
     return tar_filename
 
 
@@ -395,6 +541,108 @@ def load_tasks_config() -> dict:
     except Exception as e:
         logger.error(f"Error loading {TASKS_CONFIG_PATH}: {e}")
         return {}
+
+
+def tasks_from_config(data) -> dict:
+    """Tasks under a top-level 'tasks:' key, or, as in the original prototype, directly at the top level."""
+    if not isinstance(data, dict):
+        return {}
+    tasks = data["tasks"] if "tasks" in data else data
+    return {str(k): v for k, v in tasks.items() if isinstance(v, dict)} if isinstance(tasks, dict) else {}
+
+
+def load_tasks() -> dict:
+    return tasks_from_config(load_tasks_config())
+
+
+def legacy_memory_candidates(target_sensor: str) -> list[str]:
+    # The add-on (1.3.x) kept it in HA's config folder, the original prototype next to its script in scripts/
+    name = f"{target_sensor.replace('.', '_')}_history.json"
+    return [os.path.join(HA_CONFIG_DIR, name), os.path.join(HA_CONFIG_DIR, "scripts", name)]
+
+
+def migrate_legacy_storage() -> bool:
+    """One-time copy of the pre-1.4.0 files from Home Assistant's config folder. The originals stay untouched."""
+    if os.path.exists(TASKS_CONFIG_PATH) or not os.path.isfile(LEGACY_TASKS_CONFIG_PATH):
+        return False
+    logger.info(f"Migrating {LEGACY_TASKS_CONFIG_PATH} to the add-on config folder {CONFIG_DIR} ...")
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    shutil.copy2(LEGACY_TASKS_CONFIG_PATH, TASKS_CONFIG_PATH)
+
+    if os.path.isdir(LEGACY_PROCESSORS_DIR):
+        os.makedirs(PROCESSORS_DIR, exist_ok=True)
+        for name in sorted(os.listdir(LEGACY_PROCESSORS_DIR)):
+            source, target = os.path.join(LEGACY_PROCESSORS_DIR, name), os.path.join(PROCESSORS_DIR, name)
+            if os.path.isfile(source) and not os.path.exists(target):
+                shutil.copy2(source, target)
+                logger.info(f"  processor {name}")
+
+    for task_id, task_cfg in load_tasks().items():
+        target_sensor = task_cfg.get("target_sensor")
+        if not target_sensor:
+            continue
+        target = memory_path(task_id)
+        source = next((c for c in legacy_memory_candidates(str(target_sensor)) if os.path.isfile(c)), None)
+        if source and not os.path.exists(target):
+            os.makedirs(MEMORY_DIR, exist_ok=True)
+            shutil.copy2(source, target)
+            logger.info(f"  memory of task '{task_id}' from {os.path.basename(source)}")
+    return True
+
+
+def memory_path(task_id: str) -> str:
+    return os.path.join(MEMORY_DIR, f"{safe_name(task_id)}.json")
+
+
+def load_memory(task_id: str) -> list[dict]:
+    """Previous answers of a task, newest first."""
+    path = memory_path(task_id)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+        return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+    except Exception as e:
+        logger.warning(f"Could not read memory of task '{task_id}': {e}")
+        return []
+
+
+def save_memory(task_id: str, entries: list[dict]):
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    write_text_atomic(memory_path(task_id), json.dumps(entries, ensure_ascii=False, indent=2))
+
+
+def append_memory(task_id: str, text: str, options: dict, keep: int = MEMORY_SIZE) -> list[dict]:
+    entries = load_memory(task_id)
+    entries.insert(0, {"time": format_datetime(local_now(options), options), "text": text})
+    entries = entries[:max(keep, MEMORY_SIZE)]
+    try:
+        save_memory(task_id, entries)
+    except Exception as e:
+        logger.warning(f"Could not save memory of task '{task_id}': {e}")
+    return entries
+
+
+def clear_memory(task_id: str):
+    if os.path.exists(memory_path(task_id)):
+        os.remove(memory_path(task_id))
+
+
+def write_text_atomic(path: str, content: str):
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    os.replace(tmp_path, path)
+
+
+def result_text(result_payload) -> str:
+    """The text that represents an answer in the memory and the target sensor."""
+    if isinstance(result_payload, dict):
+        for key in ("text", "summary", "status", "value", "result", "verdict"):
+            if result_payload.get(key) not in (None, ""):
+                return str(result_payload[key])
+    return json.dumps(result_payload, ensure_ascii=False, default=str)
 
 
 def publish_task_discovery(client: mqtt.Client, task_id: str, task_config: dict):
@@ -454,35 +702,59 @@ def publish_task_state(client: mqtt.Client, task_id: str, result_data: dict):
     logger.info(f"Published retained state to {state_topic}")
 
 
+def remove_task_discovery(client: mqtt.Client, task_id: str):
+    """Deletes the sensor and button of a task that was removed from llm_tasks.yaml."""
+    clean_id = task_id.lower().replace("-", "_")
+    for topic in (
+        f"homeassistant/sensor/llm_{clean_id}/config",
+        f"homeassistant/sensor/llm_{clean_id}/state",
+        f"homeassistant/button/llm_run_{clean_id}/config",
+    ):
+        client.publish(topic, "", retain=True)
+
+
+def sync_task_discovery(old_tasks: dict, new_tasks: dict, client: mqtt.Client | None = None):
+    """Applies an edited llm_tasks.yaml to Home Assistant without restarting the add-on."""
+    client = client or _mqtt_client
+    if client is None:
+        return
+    for task_id in set(old_tasks) - set(new_tasks):
+        remove_task_discovery(client, task_id)
+    for task_id, task_cfg in new_tasks.items():
+        publish_task_discovery(client, task_id, task_cfg)
+
+
+def processor_candidates(path_value: str) -> list[str]:
+    base = os.path.basename(path_value)
+    if is_absolute(path_value):
+        return [path_value, os.path.join(PROCESSORS_DIR, base), *legacy_path_candidates(path_value)]
+    return [
+        os.path.join(PROCESSORS_DIR, path_value),
+        os.path.join(PROCESSORS_DIR, base),
+        os.path.join(CONFIG_DIR, path_value),
+        os.path.join(os.path.dirname(TASKS_CONFIG_PATH), path_value),
+        os.path.join(LEGACY_PROCESSORS_DIR, base),
+        os.path.join(HA_CONFIG_DIR, path_value),
+        path_value,
+    ]
+
+
 def resolve_config_path(path_value: str) -> str:
+    """Processor path: the add-on's processors/ folder first, then the pre-1.4.0 locations; `.py` is optional."""
     if not path_value:
         return path_value
-    if os.path.isabs(path_value):
-        return path_value
-
-    candidates = [
-        path_value,
-        os.path.join("/config", path_value),
-        os.path.join(PROCESSORS_DIR, path_value),
-        os.path.join(PROCESSORS_DIR, os.path.basename(path_value)),
-        os.path.join(os.path.dirname(TASKS_CONFIG_PATH), path_value),
-        os.path.join(os.path.dirname(TASKS_CONFIG_PATH), os.path.basename(path_value))
-    ]
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
+    names = [path_value] if path_value.endswith(".py") else [path_value, f"{path_value}.py"]
+    for name in names:
+        for candidate in processor_candidates(name):
+            if os.path.isfile(candidate):
+                return os.path.normpath(candidate)
     return path_value
 
 
 def run_processor(processor_name: str, df: pd.DataFrame, task_config: dict):
-    os.makedirs(PROCESSORS_DIR, exist_ok=True)
-
     candidate = resolve_config_path(processor_name)
-    if not os.path.exists(candidate):
-        if not processor_name.endswith(".py"):
-            candidate = f"{candidate}.py"
-    if not os.path.exists(candidate):
-        raise FileNotFoundError(f"Processor script not found: {candidate}")
+    if not os.path.isfile(candidate):
+        raise FileNotFoundError(f"Processor script not found: {processor_name}")
 
     spec = importlib.util.spec_from_file_location(os.path.basename(candidate).replace(".py", ""), candidate)
     module = importlib.util.module_from_spec(spec)
@@ -494,46 +766,18 @@ def run_processor(processor_name: str, df: pd.DataFrame, task_config: dict):
     return module.process(df, task_config)
 
 
-def write_ha_target_state(task_config: dict, result_payload: dict, options: dict | None = None):
+def write_ha_target_state(task_config: dict, result_payload: dict, options: dict | None = None, memory: list | None = None):
+    """Mirrors the result and the task memory into an extra HA state (`target_sensor:`)."""
     target_sensor = task_config.get("target_sensor")
     if not target_sensor:
         return
 
-    result_text = None
-    if isinstance(result_payload, dict):
-        for key in ("text", "summary", "status", "value", "result", "verdict"):
-            if key in result_payload and result_payload[key] not in (None, ""):
-                result_text = str(result_payload[key])
-                break
-    if result_text is None:
-        result_text = json.dumps(result_payload, ensure_ascii=False)
-
-    history_file = os.path.join(os.path.dirname(TASKS_CONFIG_PATH), f"{target_sensor.replace('.', '_')}_history.json")
-    event_history = []
-    if os.path.exists(history_file):
-        try:
-            with open(history_file, "r", encoding="utf-8") as f:
-                event_history = json.load(f)
-        except Exception:
-            event_history = []
-
-    now = local_now(options)
-    now_str = format_datetime(now, options)
-    event_history.insert(0, {"time": now_str, "text": result_text})
-    event_history = event_history[:30]
-
-    try:
-        with open(history_file, "w", encoding="utf-8") as f:
-            json.dump(event_history, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"Could not save history file {history_file}: {e}")
-
     post_url = f"{HA_URL}/api/states/{target_sensor}"
     payload = {
-        "state": now.isoformat(),
+        "state": local_now(options).isoformat(),
         "attributes": {
-            "text": result_text,
-            "history": event_history,
+            "text": result_text(result_payload),
+            "history": memory or [],
             "friendly_name": task_config.get("friendly_name", target_sensor)
         }
     }
@@ -616,7 +860,8 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
         try:
             processor_metrics, raw_data = run_processor(processor_name, df, task_config)
             metrics.update(processor_metrics or {})
-            timeseries_data = raw_data if isinstance(raw_data, str) else json.dumps(raw_data, ensure_ascii=False, default=str)
+            if raw_data is not None:
+                timeseries_data = raw_data if isinstance(raw_data, str) else json.dumps(raw_data, ensure_ascii=False, default=str)
         except Exception as e:
             logger.warning(f"Custom processor failed for task '{task_id}', using default aggregation: {e}")
             processor_name, processor_metrics, raw_data = None, None, None
@@ -632,27 +877,13 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
     for key, url in (task_config.get("urls", {}) or {}).items():
         metrics[key] = fetch_external_url(str(url))
 
-    now = local_now(options)
-    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
-    metrics["weekday"] = weekdays[now.weekday()]
-    metrics["today"] = f"{now.day} {months[now.month - 1]}"
-    metrics["now"] = format_datetime(now, options)
+    # Entity, URL and processor values keep precedence over same-named built-ins
+    for key, value in builtin_placeholders(local_now(options), options).items():
+        metrics.setdefault(key, value)
 
-    target_sensor = task_config.get("target_sensor")
-    history_text = "No history available."
-    if target_sensor:
-        history_file = os.path.join(os.path.dirname(TASKS_CONFIG_PATH), f"{target_sensor.replace('.', '_')}_history.json")
-        if os.path.exists(history_file):
-            try:
-                with open(history_file, "r", encoding="utf-8") as f:
-                    event_history = json.load(f)
-                recent = [entry.get("text", "") for entry in event_history[:int(task_config.get("history_limit", 7))] if "text" in entry]
-                if recent:
-                    history_text = "\n---\n".join(recent)
-            except Exception:
-                pass
-    metrics["history"] = history_text
+    task_memory = load_memory(task_id)
+    recent = [entry.get("text", "") for entry in task_memory[:int(task_config.get("history_limit", 7))] if entry.get("text")]
+    metrics.setdefault("history", "\n---\n".join(recent) if recent else "No history available.")
 
     metrics_payload = processor_metrics if processor_metrics is not None else metrics.copy()
 
@@ -669,10 +900,13 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
                 **metrics
             }
             formatted_prompt = custom_prompt.format(**prompt_context)
+            series_in_prompt = bool(prompt_fields(custom_prompt) & TIMESERIES_PLACEHOLDERS)
         except (KeyError, IndexError, ValueError):
             formatted_prompt = f"{custom_prompt}\n\nCURRENT VALUES:\n{json.dumps(metrics, ensure_ascii=False, indent=2)}"
-            if timeseries_data and timeseries_data not in ("No history requested.", "No time series data available."):
-                formatted_prompt += f"\n\nMEASUREMENTS (JSON):\n{timeseries_data}"
+            series_in_prompt = False
+        # Like the original prototype: requested history is always sent, as JSON, even if the prompt doesn't ask for it
+        if timeseries_data and not series_in_prompt:
+            formatted_prompt += f"\n\nMEASUREMENTS (JSON):\n{timeseries_data}"
 
         if loaded_image_names:
             image_names = ", ".join(loaded_image_names)
@@ -709,42 +943,108 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
     if audit_enabled:
         try:
             verdict_text = result_payload.get("text") or result_payload.get("summary") or result_payload.get("verdict") or json.dumps(result_payload, ensure_ascii=False)
-            create_audit_archive(task_id, formatted_prompt if custom_prompt else "", str(verdict_text), metrics, timeseries_data, images)
+            create_audit_archive(task_id, formatted_prompt if custom_prompt else "", str(verdict_text), metrics, timeseries_data, images, options)
         except Exception as e:
             logger.warning(f"Could not create audit archive for task '{task_id}': {e}")
 
-    write_ha_target_state(task_config, result_payload, options)
-    publish_task_state(client, task_id, result_payload)
+    # LLM answers always go into the task memory ({history}); plain data tasks only when mirrored to a target_sensor
+    if custom_prompt or task_config.get("target_sensor"):
+        task_memory = append_memory(task_id, result_text(result_payload), options, keep=int(task_config.get("history_limit", 7)))
+    write_ha_target_state(task_config, result_payload, options, task_memory)
+
+    client = client or _mqtt_client
+    if client is not None:
+        publish_task_state(client, task_id, result_payload)
+    else:
+        logger.warning(f"MQTT not connected, result of task '{task_id}' was not published.")
     logger.info(f"Task '{task_id}' finished successfully.")
+    return {
+        "prompt": formatted_prompt if custom_prompt else "",
+        "result": result_payload,
+        "attachments": loaded_image_names + loaded_file_names,
+    }
 
 
-def run_all_tasks(client: mqtt.Client, options: dict):
-    tasks_cfg = load_tasks_config()
-    tasks = tasks_cfg.get("tasks", {})
+def task_status(task_id: str) -> dict:
+    return dict(TASK_STATUS.get(task_id, {"state": "idle"}))
+
+
+def run_task(task_id: str, task_config: dict, client: mqtt.Client | None, options: dict) -> bool:
+    """Runs one task with status tracking. Tasks run one at a time, whoever triggers them (MQTT, UI, start-up)."""
+    status = TASK_STATUS.setdefault(task_id, {})
+    status.update({"state": "queued", "queued_at": local_now(options).isoformat()})
+    with _run_lock:
+        started = time.monotonic()
+        status.update({"state": "running", "started_at": local_now(options).isoformat(), "error": None})
+        try:
+            outcome = execute_task(task_id, task_config, client, options) or {}
+            status.update({
+                "state": "ok",
+                "last_prompt": outcome.get("prompt", ""),
+                "last_result": outcome.get("result"),
+                "attachments": outcome.get("attachments", []),
+            })
+            return True
+        except Exception as e:
+            logger.exception(f"Error executing task '{task_id}': {e}")
+            status.update({"state": "error", "error": f"{type(e).__name__}: {e}"})
+            return False
+        finally:
+            status.update({
+                "finished_at": local_now(options).isoformat(),
+                "duration": round(time.monotonic() - started, 2),
+            })
+
+
+def run_task_async(task_id: str, task_config: dict, client: mqtt.Client | None, options: dict) -> threading.Thread:
+    # Off the MQTT network loop: an LLM call can take a minute and would otherwise stall keep-alives
+    TASK_STATUS.setdefault(task_id, {})["state"] = "queued"
+    thread = threading.Thread(target=run_task, args=(task_id, task_config, client, options), name=f"task-{task_id}", daemon=True)
+    thread.start()
+    return thread
+
+
+def run_all_tasks(client: mqtt.Client | None, options: dict):
+    tasks = load_tasks()
     if not tasks:
         logger.info("No tasks configured in llm_tasks.yaml.")
         return
 
     for task_id, task_cfg in tasks.items():
-        publish_task_discovery(client, task_id, task_cfg)
+        run_task(task_id, task_cfg, client, options)
 
-    for task_id, task_cfg in tasks.items():
-        try:
-            execute_task(task_id, task_cfg, client, options)
-        except Exception as e:
-            logger.exception(f"Error executing task '{task_id}': {e}")
+
+def run_all_tasks_async(client: mqtt.Client | None, options: dict) -> threading.Thread:
+    for task_id in load_tasks():
+        TASK_STATUS.setdefault(task_id, {})["state"] = "queued"
+    thread = threading.Thread(target=run_all_tasks, args=(client, options), name="run-all", daemon=True)
+    thread.start()
+    return thread
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
+    global _mqtt_client
     if rc == 0:
         logger.info("Connected to MQTT Broker. Subscribing to trigger topics...")
+        _mqtt_client = client
+        MQTT_STATUS.update({"connected": True, "error": None})
         client.subscribe("ha_llm_runner/run")
         client.subscribe("ha_llm_runner/run/+")
-        # Initial discovery and task run on container start
-        options = load_options()
-        run_all_tasks(client, options)
+        tasks = load_tasks()
+        for task_id, task_cfg in tasks.items():
+            publish_task_discovery(client, task_id, task_cfg)
+        # Run everything once per container start only, not again after every broker reconnect
+        if not MQTT_STATUS.get("initial_run_done"):
+            MQTT_STATUS["initial_run_done"] = True
+            run_all_tasks_async(client, load_options())
     else:
+        MQTT_STATUS.update({"connected": False, "error": f"connection refused (code {rc})"})
         logger.error(f"MQTT connection failed with code {rc}")
+
+
+def on_disconnect(client, userdata, *args):
+    MQTT_STATUS["connected"] = False
+    logger.warning("Disconnected from MQTT Broker, reconnecting...")
 
 
 def on_message(client, userdata, msg):
@@ -753,8 +1053,7 @@ def on_message(client, userdata, msg):
     logger.info(f"Received MQTT trigger on {topic} (payload: '{payload}')")
 
     options = load_options()
-    tasks_cfg = load_tasks_config()
-    tasks = tasks_cfg.get("tasks", {})
+    tasks = load_tasks()
 
     target_task = None
     if "/" in topic.replace("ha_llm_runner/run", ""):
@@ -764,25 +1063,56 @@ def on_message(client, userdata, msg):
 
     if target_task:
         if target_task in tasks:
-            try:
-                execute_task(target_task, tasks[target_task], client, options)
-            except Exception as e:
-                logger.exception(f"Error running requested task '{target_task}': {e}")
+            run_task_async(target_task, tasks[target_task], client, options)
         else:
             logger.warning(f"Requested task '{target_task}' not found in llm_tasks.yaml.")
     else:
-        run_all_tasks(client, options)
+        run_all_tasks_async(client, options)
+
+
+def prepare_storage():
+    try:
+        migrate_legacy_storage()
+    except Exception as e:
+        logger.error(f"Migration of the pre-1.4.0 files failed: {e}")
+    for folder in (PROCESSORS_DIR, MEMORY_DIR, AUDIT_DIR):
+        os.makedirs(folder, exist_ok=True)
+    if not os.path.exists(TASKS_CONFIG_PATH):
+        logger.warning(f"No tasks yet. Create {TASKS_CONFIG_PATH} in the web UI or via the addon_configs share.")
+
+
+def check_ha_api() -> bool:
+    """Logs once at startup whether the Home Assistant API is usable, so auth problems show up immediately."""
+    token = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HA_TOKEN") or ""
+    if not token:
+        logger.error("No SUPERVISOR_TOKEN in the environment: Home Assistant data can't be read.")
+        return False
+    try:
+        r = requests.get(f"{HA_URL}/api/", headers=get_ha_headers(), timeout=10)
+        r.raise_for_status()
+        logger.info("Home Assistant API reachable.")
+        return True
+    except Exception as e:
+        logger.error(f"Home Assistant API not usable (token with {len(token)} characters): {e}")
+        return False
 
 
 def main():
     logger.info("Starting HA LLM Runner Add-on (Event-driven via MQTT)...")
-    os.makedirs(PROCESSORS_DIR, exist_ok=True)
+    prepare_storage()
+    check_ha_api()
 
     options = load_options()
     host = options.get("mqtt_host", "core-mosquitto")
     port = int(options.get("mqtt_port", 1883))
     user = options.get("mqtt_user")
     password = options.get("mqtt_password")
+
+    try:
+        import web
+        web.start_web_server(sys.modules[__name__], port=int(os.environ.get("INGRESS_PORT", web.DEFAULT_PORT)))
+    except Exception as e:
+        logger.error(f"Web UI could not be started: {e}")
 
     if hasattr(mqtt, "CallbackAPIVersion"):
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ha_llm_runner")
@@ -793,11 +1123,13 @@ def main():
         client.username_pw_set(user, password)
 
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
     logger.info(f"Connecting to MQTT Broker at {host}:{port}...")
-    client.connect(host, port, 60)
-    client.loop_forever()
+    # Asynchronous connect + retry: the web UI stays usable while the broker is unreachable
+    client.connect_async(host, port, 60)
+    client.loop_forever(retry_first_connection=True)
 
 
 if __name__ == "__main__":

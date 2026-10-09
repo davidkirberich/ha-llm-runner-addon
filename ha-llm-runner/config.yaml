@@ -1,6 +1,6 @@
 name: "HA LLM Runner"
-description: "LLM-powered data processor and predictor with pluggable LLM providers and MQTT Discovery."
-version: "1.3.1"
+description: "LLM-powered data processor and predictor with pluggable AI providers and MQTT Discovery."
+version: "1.4.0"
 slug: "ha_llm_runner"
 init: false
 arch:
@@ -9,12 +9,20 @@ arch:
 startup: services
 boot: auto
 homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:brain
+panel_title: "LLM Runner"
 map:
-  - config:rw
+  - addon_config:rw
+  - homeassistant_config:ro
+backup_exclude:
+  - "audit/*"
 options:
   gemini_api_key: ""
   gemini_model: "gemini-3.5-flash-lite"
   audit_archive: true
+  audit_retention_days: 30
   datetime_format: "%d.%m.%Y %H:%M:%S"
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
@@ -24,7 +32,9 @@ schema:
   gemini_api_key: password
   gemini_model: str
   audit_archive: bool
+  audit_retention_days: int(0,)
   timezone: str?
+  language: str?
   datetime_format: str?
   mqtt_host: str
   mqtt_port: int

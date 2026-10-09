@@ -19,10 +19,12 @@ Or add `https://github.com/davidkirberich/ha-llm-runner-addon` manually under **
 - **Persistent Across Reboots via MQTT Discovery:** Automatically provisions entities in Home Assistant with `retain: true`. No volatile REST states, eliminating data loss during host or core restarts.
 - **Strictly Typed Structured Outputs:** Enforces valid JSON directly at the API level via Google Gemini, avoiding fragile regex or text parsing.
 - **Full Recorder Integration:** Publishes primary states for immediate tracking while storing structured arrays (e.g., multi-day records) in entity attributes for long-term database storage.
-- **Camera and File Attachments:** `camera.*` entities and snapshot/MJPEG URLs in `entities:` are attached as a single still frame. Anything listed under `files:` (images, audio, video, PDFs, ...) is attached as-is from an `http(s)://` URL or a local path (absolute or relative to `/config`), up to 20 MB per file. Credentials in a URL (`http://user:pass@host/...`) are sent via Digest auth.
-- **Audit Archives (optional):** Each LLM task stores its prompt, response, values and attachments as a `.tar.gz` archive. Turn this off globally with the add-on option `audit_archive: false`, or per task with `audit: false`.
-- **Time Zone and Date Format:** Timestamps, time series and the `{now}` / `{today}` / `{weekday}` prompt placeholders use the time zone configured in Home Assistant. Override it globally with the add-on option `timezone` (e.g. `Europe/Berlin`) and change the `{now}` / history format with `datetime_format` (default `%d.%m.%Y %H:%M:%S`).
-- **Custom Local Processors:** Allows to integrate custom preprocessing pipelines from `/config/scripts/processors/` before feeding data to the LLM.
+- **Camera and File Attachments:** `camera.*` entities and snapshot/MJPEG URLs in `entities:` are attached as a single still frame. Anything listed under `files:` (images, audio, video, PDFs, ...) is attached as-is from an `http(s)://` URL or a local path (absolute, or relative to Home Assistant's configuration folder), up to 20 MB per file. Credentials in a URL (`http://user:pass@host/...`) are sent via Digest auth.
+- **Web Interface (Ingress):** A sidebar panel shows task status and results, runs tasks, and edits `llm_tasks.yaml` and processors with validation. It also browses audit archives.
+- **Task Memory:** Every task remembers its last 30 answers. `{history}` feeds them back into the prompt, e.g. so a daily briefing doesn't suggest the same recipe twice.
+- **Audit Archives (optional):** Each LLM task stores its prompt, response, values and attachments as a `.tar.gz` archive, kept for `audit_retention_days` (default 30) and excluded from backups. Turn this off globally with the add-on option `audit_archive: false`, or per task with `audit: false`.
+- **Time Zone, Language and Date Format:** Timestamps, time series and the `{now}` / `{today}` / `{weekday}` / `{month}` prompt placeholders use the time zone and language configured in Home Assistant. Override them with the add-on options `timezone` (e.g. `Europe/Berlin`) and `language` (e.g. `de`), and change the `{now}` / history format with `datetime_format` (default `%d.%m.%Y %H:%M:%S`).
+- **Custom Local Processors:** Allows to integrate custom preprocessing pipelines from the add-on's `processors/` folder before feeding data to the LLM.
 
 ---
 
@@ -36,11 +38,15 @@ Or add `https://github.com/davidkirberich/ha-llm-runner-addon` manually under **
        │
        ▼  (MQTT Discovery + Retain)
 [ Mosquitto Broker ] ────► [ Home Assistant State Machine & Recorder ]
+
+[ HA sidebar (Ingress) ] ──► [ web.py: status, editors, audit browser ]
 ```
 
 | Path | Purpose |
 | --- | --- |
-| [`ha-llm-runner/run.py`](ha-llm-runner/run.py) | Runner: loads tasks, collects inputs, builds prompts, publishes results |
+| [`ha-llm-runner/run.py`](ha-llm-runner/run.py) | Runner: loads tasks, collects inputs, builds prompts, publishes results, task memory and storage migration |
+| [`ha-llm-runner/web.py`](ha-llm-runner/web.py) | Ingress web server and JSON API for the sidebar panel |
+| [`ha-llm-runner/web/`](ha-llm-runner/web/) | Web interface (single static `index.html`) |
 | [`ha-llm-runner/llm_providers/`](ha-llm-runner/llm_providers/) | Provider layer (one class per LLM API) |
 | [`ha-llm-runner/config.yaml`](ha-llm-runner/config.yaml) | Add-on manifest, options and schema |
 | [`ha-llm-runner/DOCS.md`](ha-llm-runner/DOCS.md) | User documentation (Documentation tab) |
@@ -154,6 +160,16 @@ python -m pytest
 ```
 
 `requirements-dev.txt` also installs the add-on runtime dependencies from `ha-llm-runner/requirements.txt`. All network calls to Home Assistant and LLM APIs are mocked.
+
+### Testing on your own Home Assistant
+
+[`scripts/deploy-local.ps1`](scripts/deploy-local.ps1) copies the working copy to Home Assistant as a local add-on and installs, updates or rebuilds it there. It needs the **Advanced SSH & Web Terminal** add-on with your public key in `authorized_keys`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy-local.ps1 -HostName homeassistant.local
+```
+
+`-CheckOnly` only tests the connection. The local add-on (slug `local_ha_llm_runner`) has its own config folder. Stop the GitHub-installed version while testing, because both use the same MQTT topics and entities.
 
 ---
 

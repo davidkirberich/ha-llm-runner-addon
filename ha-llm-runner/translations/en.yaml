@@ -7,13 +7,19 @@ configuration:
     description: "Model for Gemini tasks without their own 'model:' (e.g. gemini-3.5-flash-lite)."
   audit_archive:
     name: "Audit Archive"
-    description: "Save prompt, response, values and attachments of each LLM task as a .tar.gz audit archive. A task can opt out with 'audit: false'. When disabled, no archives are written at all."
+    description: "Save prompt, response, values and attachments of each LLM task as a .tar.gz audit archive in the add-on config folder (audit/, excluded from backups). A task can opt out with 'audit: false'. When disabled, no archives are written at all."
+  audit_retention_days:
+    name: "Audit Retention (days)"
+    description: "Delete audit archives older than this many days (default: 30). 0 keeps all archives."
   timezone:
     name: "Time Zone"
     description: "Optional IANA time zone (e.g. 'Europe/Berlin') for timestamps, prompts and time series. Leave empty to use the time zone configured in Home Assistant."
+  language:
+    name: "Language"
+    description: "Optional language for day and month names in prompt placeholders such as {weekday}, {today} and {month} (e.g. 'de', 'en-GB', 'fr'). Leave empty to use the language configured in Home Assistant."
   datetime_format:
     name: "Date/Time Format"
-    description: "strftime format for the {now} prompt placeholder and target sensor history entries (default: %d.%m.%Y %H:%M:%S)."
+    description: "strftime format for the {now} prompt placeholder and target sensor history entries (default: %d.%m.%Y %H:%M:%S). Day and month names (%A, %a, %B, %b) follow the configured language."
   mqtt_host:
     name: "MQTT Host"
     description: "Hostname or IP of the MQTT broker (e.g. 'core-mosquitto' for the HA add-on)."

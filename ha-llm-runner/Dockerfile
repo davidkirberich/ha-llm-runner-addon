@@ -15,7 +15,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY llm_providers/ ./llm_providers/
-COPY run.py .
+COPY run.py web.py ./
+COPY web/ ./web/
 RUN chmod a+x run.py
 
-CMD [ "python3", "/app/run.py" ]
+# s6-overlay (base image) starts CMD with a cleared environment; with-contenv restores SUPERVISOR_TOKEN etc.
+CMD [ "/usr/bin/with-contenv", "python3", "/app/run.py" ]

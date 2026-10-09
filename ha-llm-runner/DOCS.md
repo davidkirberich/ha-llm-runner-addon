@@ -7,7 +7,9 @@ Runs LLM tasks over your Home Assistant data: current states, sensor history, ca
 1. Install and start the **Mosquitto broker** add-on, and set up the **MQTT** integration in Home Assistant.
 2. Add this repository to the add-on store: **Settings > Add-ons > Add-on Store > ... > Repositories** and enter `https://github.com/davidkirberich/ha-llm-runner-addon`.
 3. Install **HA LLM Runner**, enter your API key on the **Configuration** tab and start the add-on.
-4. Create `/config/llm_tasks.yaml` with your tasks (see below) and restart the add-on.
+4. Open **LLM Runner** in the sidebar (or **Open Web UI** on the add-on page), add your tasks on the **llm_tasks.yaml** tab (see below) and save.
+
+Upgrading from 1.3.x? Your files are copied to the new location automatically on the first start (see *Files and folders* below).
 
 ## Configuration
 
@@ -15,23 +17,60 @@ Runs LLM tasks over your Home Assistant data: current states, sensor history, ca
 | --- | --- | --- |
 | `gemini_api_key` | - | API key from [Google AI Studio](https://aistudio.google.com/apikey). |
 | `gemini_model` | `gemini-3.5-flash-lite` | Model for tasks without their own `model:`. |
-| `audit_archive` | `true` | Store prompt, answer, values and attachments of each LLM run as a `.tar.gz` archive inside the add-on container (cleared when the add-on is updated or rebuilt). |
+| `audit_archive` | `true` | Store prompt, answer, values and attachments of each LLM run as a `.tar.gz` archive in the `audit/` folder (see *Files and folders* below). |
+| `audit_retention_days` | `30` | Delete audit archives older than this many days. `0` keeps all archives. |
 | `timezone` | Home Assistant's time zone | IANA time zone (e.g. `Europe/Berlin`) for timestamps, prompts and time series. |
-| `datetime_format` | `%d.%m.%Y %H:%M:%S` | [strftime](https://strftime.org/) format for `{now}` and the `target_sensor` history. |
+| `language` | Home Assistant's language | Language of day and month names in `{weekday}`, `{today}`, `{date}`, `{time}`, `{month}` and `{now}` (e.g. `de`, `en-GB`, `fr`). |
+| `datetime_format` | `%d.%m.%Y %H:%M:%S` | [strftime](https://strftime.org/) format for `{now}` and the `target_sensor` history. `%A`, `%a`, `%B` and `%b` follow `language`. |
 | `mqtt_host` | `core-mosquitto` | MQTT broker host. |
 | `mqtt_port` | `1883` | MQTT broker port. |
 | `mqtt_user` / `mqtt_password` | - | MQTT credentials, if the broker requires them. |
 
 ## How tasks work
 
-Tasks live in `/config/llm_tasks.yaml` under a top-level `tasks:` key. For each task, the add-on creates a sensor (named after `name:`) and a **Run** button. A task runs:
+Tasks live in `llm_tasks.yaml` under a top-level `tasks:` key. For each task, the add-on creates a sensor (named after `name:`) and a **Run** button. A task runs:
 
 - once when the add-on starts,
 - when its button is pressed,
+- when **Run** is clicked in the web UI,
 - when any message is published to `ha_llm_runner/run/<task_id>`,
 - when its task id (or `all` for every task) is published to `ha_llm_runner/run`.
 
-Changes to `llm_tasks.yaml` are picked up on the next run. Restart the add-on to update the sensors and buttons of new or renamed tasks.
+Tasks run one at a time in the background; a run that is requested while another task is running waits for it.
+
+Changes to `llm_tasks.yaml` are picked up on the next run. When you save the file in the web UI, the sensors and buttons of new, renamed and removed tasks are updated right away. If you edit the file in another way, restart the add-on for that.
+
+## Web interface
+
+The add-on adds **LLM Runner** to the Home Assistant sidebar. It shows:
+
+- **Tasks**: status, duration and errors of the last run, the last result and prompt, and the task's memory (with **Clear memory**). Every task can be run from here, also without an MQTT connection.
+- **llm_tasks.yaml**: an editor with validation. Saving checks the YAML first, warns about unknown keys and missing processors, and keeps the previous version as `llm_tasks.yaml.bak`.
+- **Processors**: create, edit and delete processor scripts. Saving checks the Python syntax.
+- **Audit**: browse, view, download and delete audit archives, including the attached images.
+
+The web interface is only reachable through Home Assistant (Ingress) and is available to administrators only. Processors are Python code that runs inside the add-on, so treat access to the add-on like admin access to Home Assistant.
+
+## Files and folders
+
+The add-on keeps its files in its own folder. In the add-on it is `/config`; from outside (Samba, SSH, File editor) it is `/addon_configs/<id>_ha_llm_runner` (`/app_configs/...` in newer Home Assistant versions), where `<id>` depends on the repository. It is included in Home Assistant backups, except `audit/`.
+
+| Path | Content |
+| --- | --- |
+| `llm_tasks.yaml` | Task definitions. |
+| `processors/` | Processor scripts (see `data_processor:`). |
+| `memory/<task_id>.json` | The last 30 answers of each task (see `{history}`). |
+| `audit/` | Audit archives `audit_<task_id>_<timestamp>.tar.gz`, deleted after `audit_retention_days`. |
+
+Home Assistant's configuration folder is mounted read-only at `/homeassistant`, for example for `files:`.
+
+**Upgrading from 1.3.x.** Up to 1.3.x, the files lived in Home Assistant's configuration folder. On the first start of 1.4.0, the add-on copies them, without overwriting anything that already exists:
+
+- `/config/llm_tasks.yaml` to `llm_tasks.yaml`,
+- `/config/scripts/processors/*.py` to `processors/`,
+- `/config/<target_sensor>_history.json` or `/config/scripts/<target_sensor>_history.json` (where the original standalone script kept them) to `memory/<task_id>.json`.
+
+The old files are left in place and can be deleted afterwards. Existing tasks keep working unchanged: processor paths and `/config/...` paths in `files:` that point into Home Assistant's configuration folder are still found. Task files from the original standalone script, which list the tasks at the top level without a `tasks:` key, are accepted as well. That script always used German day and month names; if Home Assistant's language is not German, set the `language` option to `de` to keep them.
 
 ## Example tasks
 
@@ -180,12 +219,27 @@ For an Echo announcement, add a second action with your Alexa notify service (e.
 | --- | --- |
 | `{<key>}` | Current state of each entry under `entities:` (use `sensor.x:attribute` for an attribute) |
 | `{timeseries}` | History of all `entities:` as JSON (`hours:` window, `resample:` buckets) |
-| `{now}`, `{today}`, `{weekday}` | Current date and time in Home Assistant's time zone |
-| `{history}` | Previous answers of this task (requires `target_sensor:`, last `history_limit:` entries, default 7) |
+| `{history}` | Previous answers of this task, newest first, separated by `---` (last `history_limit:` entries, default 7) |
 | `{metrics}` | All current values as one JSON object |
 | `{data}` | Output of the custom processor (see `data_processor:`), otherwise the same as `{metrics}` |
 
-Literal braces must be doubled (`{{` / `}}`). If the prompt references an unknown placeholder, it is sent unformatted with the current values and the time series appended instead.
+Built-in date and time placeholders use Home Assistant's time zone and language (or the `timezone` / `language` options). Examples for Friday, 9 October 2026, 16:24:
+
+| Placeholder | `de` | `en` | `en-GB` |
+| --- | --- | --- | --- |
+| `{weekday}` | Freitag | Friday | Friday |
+| `{today}` | 9. Oktober | October 9 | 9 October |
+| `{date}` | 9. Oktober 2026 | October 9, 2026 | 9 October 2026 |
+| `{time}` | 16:24 | 4:24 PM | 16:24 |
+| `{month}` | Oktober | October | October |
+| `{year}` | 2026 | 2026 | 2026 |
+| `{now}` | `datetime_format`, e.g. 09.10.2026 16:24:10 | | |
+
+An entry under `entities:` (or a processor metric) with the same name, e.g. `month`, takes precedence over the built-in placeholder.
+
+If history was loaded (`hours:` greater than 0 and at least one plain entity) or a processor returned data, but the prompt uses neither `{timeseries}` nor `{data}`, the time series is appended to the prompt as a `MEASUREMENTS (JSON)` block. Set `hours: 0` if a task doesn't need the history.
+
+Literal braces must be doubled (`{{` / `}}`). If the prompt references an unknown placeholder, it is sent unformatted with the current values (and the time series) appended instead.
 
 ## Task reference
 
@@ -212,8 +266,8 @@ tasks:
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `entities` | map `key: source` | - | Data sources, each available as `{key}` in the prompt. The source type is detected by its value: `sensor.x` (any entity) gives the current state, `sensor.x:attribute` gives one attribute, `calendar.x` gives the events of the next 14 days as text, and `camera.x` or an `http(s)://` URL attaches an image snapshot to the request. Plain entities and attributes also feed the history (see `hours:`). A plain list of entity ids is accepted too (keys become `0`, `1`, ...; no camera/calendar detection). |
-| `files` | map `key: url-or-path` | - | Files of any type (image, audio, video, PDF, CSV, ...) attached to the request. Accepts `http(s)://` URLs (`user:pass@` credentials supported) or paths, relative ones resolved against `/config`. Max 20 MB each. Whether a type is understood depends on the model. |
+| `entities` | map `key: source` | - | Data sources, each available as `{key}` in the prompt. The source type is detected by its value: `sensor.x` (any entity) gives the current state, `sensor.x:attribute` gives one attribute, `calendar.x` gives the events of the next 14 days as text, and `camera.x` or an `http(s)://` URL attaches an image snapshot to the request. Snapshot URLs are fetched directly from the camera (`user:pass@` is sent as Digest auth, MJPEG streams are supported); prefer them when a `camera.x` entity doesn't deliver reliable stills, e.g. a Hikvision door station's `/ISAPI/Streaming/channels/101/picture`. Plain entities and attributes also feed the history (see `hours:`). A plain list of entity ids is accepted too (keys become `0`, `1`, ...; no camera/calendar detection). |
+| `files` | map `key: url-or-path` | - | Files of any type (image, audio, video, PDF, CSV, ...) attached to the request. Accepts `http(s)://` URLs (`user:pass@` credentials supported) or paths. Relative paths are looked up in Home Assistant's configuration folder first, then in the add-on folder. Max 20 MB each. Whether a type is understood depends on the model. |
 | `urls` | map `key: url` | - | Web pages fetched as text (first 15,000 characters) into `{key}`. |
 
 ### History and processing
@@ -221,14 +275,14 @@ tasks:
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `hours` | int | `24` | History window loaded from the recorder for the entities. `0` disables history. |
-| `resample` | string | `1h` | Bucket size for averaging the history ([pandas offset](https://pandas.pydata.org/docs/user_guide/timeseries.html#offset-aliases), e.g. `15min`, `2h`, `1D`). The result goes into `{timeseries}`. |
-| `data_processor` | string | - | Custom Python script that replaces the default aggregation (see below). Searched in `/config`, `/config/scripts/processors` and next to `llm_tasks.yaml`; the `.py` suffix is optional. If the script fails, the default aggregation is used. |
+| `resample` | string | `1h` | Bucket size for averaging the history ([pandas offset](https://pandas.pydata.org/docs/user_guide/timeseries.html#offset-aliases), e.g. `15min`, `2h`, `1D`). The result goes into `{timeseries}`, or is appended to the prompt if the prompt doesn't use it. |
+| `data_processor` | string | - | Custom Python script that replaces the default aggregation (see below). Searched in the add-on's `processors/` folder first, then in the pre-1.4.0 locations (`/config/scripts/processors` and `/config` of Home Assistant); the `.py` suffix is optional, so `solar_forecast` is enough. If the script fails, the default aggregation is used. |
 | `processor` | string | - | Alias of `data_processor`. |
 
 A processor exports one function. It receives the raw history as a `pandas.DataFrame` (one column per entity key, an empty frame if no history was loaded) and the task config. It must return a dict of metrics, which become prompt placeholders, plus any JSON-serializable data, which becomes `{data}` and `{timeseries}`:
 
 ```python
-# /config/scripts/processors/solar_forecast.py
+# processors/solar_forecast.py
 def process(df, config):
     daily = df.resample("1D").mean().round(1)
     return {"pv_avg": float(df["pv"].mean())}, daily.reset_index().to_dict("records")
@@ -248,10 +302,10 @@ def process(df, config):
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `target_sensor` | entity id | - | Additionally writes the result to this entity via the HA REST API: the state is the timestamp, and the attributes are `text` and `history` (the last 30 answers). The history is kept in `/config/<target_sensor>_history.json` and enables `{history}`. |
+| `target_sensor` | entity id | - | Additionally writes the result to this entity via the HA REST API: the state is the timestamp, and the attributes are `text` and `history` (the task's memory, the last 30 answers). |
 | `friendly_name` | string | value of `target_sensor` | Friendly name of `target_sensor`. |
-| `history_limit` | int | `7` | Number of previous answers inserted via `{history}`. |
-| `audit` | bool | `true` if `prompt` is set | Stores the prompt, answer, values and attachments of every run in a `.tar.gz` archive. Ignored when the add-on option `audit_archive` is off. |
+| `history_limit` | int | `7` | Number of previous answers inserted via `{history}`. Every task with a `prompt` keeps its last 30 answers (or `history_limit`, if larger) in `memory/<task_id>.json`, with or without `target_sensor`. Failed runs are not added. |
+| `audit` | bool | `true` if `prompt` is set | Stores the prompt, answer, values and attachments of every run in a `.tar.gz` archive in `audit/`. Ignored when the add-on option `audit_archive` is off. |
 
 ## LLM providers
 
