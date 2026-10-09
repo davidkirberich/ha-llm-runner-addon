@@ -1,6 +1,6 @@
 # Project Guidelines
 
-Home Assistant add-on that runs LLM tasks defined in `/config/llm_tasks.yaml` over HA sensor history, cameras, files, calendars and URLs, and publishes the results via MQTT discovery. User-facing behaviour, the task attribute reference and the provider guide live in [README.md](README.md); real-world use cases live in [EXAMPLES.md](EXAMPLES.md). Read it before changing task behaviour.
+Home Assistant add-on that runs LLM tasks defined in `/config/llm_tasks.yaml` over HA sensor history, cameras, files, calendars and URLs, and publishes the results via MQTT discovery. User-facing documentation (options, task reference, placeholders, examples) lives in [ha-llm-runner/DOCS.md](ha-llm-runner/DOCS.md), which Home Assistant shows on the add-on's Documentation tab. The root [README.md](README.md) is for GitHub: features, architecture, provider developer guide and tests. Read DOCS.md before changing task behaviour.
 
 ## Architecture
 
@@ -22,9 +22,10 @@ Tests must not hit the network or a real Home Assistant. Stub the `run` / provid
 
 - **Backward compatibility is mandatory.** Existing user task YAMLs must keep working. Never rename or remove task keys, add-on options or prompt placeholders. Add new optional ones with defaults that preserve current behaviour.
 - Add-on options for providers follow `<provider>_api_key` / `<provider>_model`. Use `api_key_option_names()` / `model_option_name()`; don't invent new patterns.
-- New option: update `config.yaml` (`options` + `schema`), `translations/en.yaml` and the README together.
-- New task key or placeholder: document it in the README "Task reference" / "Prompt placeholders" tables.
-- Bump `version` in `config.yaml` for any change that affects runtime behaviour.
+- New option: update `config.yaml` (`options` + `schema`), `translations/en.yaml` and the options table in `DOCS.md` together.
+- New task key or placeholder: document it in the `DOCS.md` "Task reference" / "Prompt placeholders" tables.
+- Behaviour change: bump `version` in `config.yaml` and add an entry to [ha-llm-runner/CHANGELOG.md](ha-llm-runner/CHANGELOG.md).
+- `DOCS.md` is rendered inside Home Assistant, where relative links don't work. Use full GitHub URLs there.
 - New Python module or package: add a `COPY` line to the [Dockerfile](ha-llm-runner/Dockerfile). New runtime dependency: add it to `ha-llm-runner/requirements.txt`. Images are Alpine-based, so prefer pure-Python packages.
 - Dates and times: use `local_now(options)`, `format_datetime()` and `get_local_timezone(options)`. Never hard-code `UTC` or a specific zone such as `Europe/Berlin`.
 - All code, comments, logs and prompts are in English.
