@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local web UI testing (scripts/dev-web.py)
+.dev-config/

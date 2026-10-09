@@ -161,6 +161,17 @@ python -m pytest
 
 `requirements-dev.txt` also installs the add-on runtime dependencies from `ha-llm-runner/requirements.txt`. All network calls to Home Assistant and LLM APIs are mocked.
 
+### Testing the web interface on your computer
+
+[`scripts/dev-web.py`](scripts/dev-web.py) starts the web interface locally at <http://localhost:8099>, without Home Assistant, MQTT or LLM calls:
+
+```powershell
+python scripts/dev-web.py                                # sample llm_tasks.yaml in .dev-config/
+python scripts/dev-web.py --pull homeassistant.local     # copy of the production configuration (via SSH)
+```
+
+Files are read from and saved to `.dev-config/` (ignored by git). **Run** only simulates a task: it returns a dummy answer after two seconds and leaves the memory untouched. Restart the script after changing `web.py` or `web/index.html`. With `--live`, tasks really run against Home Assistant and write the real sensors; this needs `SUPERVISOR_URL` (e.g. `http://homeassistant.local:8123`), `HA_TOKEN` (a long-lived access token) and `GEMINI_API_KEY`.
+
 ### Testing on your own Home Assistant
 
 [`scripts/deploy-local.ps1`](scripts/deploy-local.ps1) copies the working copy to Home Assistant as a local add-on and installs, updates or rebuilds it there. It needs the **Advanced SSH & Web Terminal** add-on with your public key in `authorized_keys`:
