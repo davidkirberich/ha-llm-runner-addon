@@ -70,6 +70,12 @@ fi
 if [ "__TRANSFER__" = "1" ] && [ -z "$NOT_INSTALLED" ]; then
   STORE=$(ha $CLI --raw-json | jq -r '.data.addons[] | select(.slug | endswith("___FOLDER__")) | select(.slug != "__SLUG__") | .slug' | head -1)
   [ -n "$STORE" ] || { echo "No store version of the add-on is installed. Install it first, or omit -Transfer."; exit 1; }
+  SRC=$CONFIGS/__SLUG__; DST=$CONFIGS/$STORE
+  if [ -e "$DST/llm_tasks.yaml" ]; then
+    echo "$STORE already has its own llm_tasks.yaml, so nothing was transferred, stopped or removed."
+    echo "Move $DST/llm_tasks.yaml away to transfer, or run with -Remove only to keep the store configuration."
+    exit 1
+  fi
   echo "Transferring to $STORE ..."
   if [ "$(info $STORE | jq -r '.data.update_available')" = "true" ]; then
     ha $CLI stop $STORE >/dev/null 2>&1 || true
@@ -77,11 +83,6 @@ if [ "__TRANSFER__" = "1" ] && [ -z "$NOT_INSTALLED" ]; then
   fi
   ha $CLI stop __SLUG__ >/dev/null 2>&1 || true
   ha $CLI stop $STORE >/dev/null 2>&1 || true
-  SRC=$CONFIGS/__SLUG__; DST=$CONFIGS/$STORE
-  if [ -e "$DST/llm_tasks.yaml" ]; then
-    echo "$DST already contains llm_tasks.yaml; nothing was copied or removed. Move it away and run again."
-    exit 1
-  fi
   mkdir -p "$DST"
   cp -a "$SRC"/. "$DST"/
   rm -rf "$DST"/processors/__pycache__
