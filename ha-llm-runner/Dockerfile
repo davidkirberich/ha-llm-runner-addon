@@ -14,6 +14,7 @@ RUN apk add --no-cache \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY llm_providers/ ./llm_providers/
 COPY run.py .
 RUN chmod a+x run.py
 

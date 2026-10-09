@@ -1,10 +1,19 @@
 configuration:
   gemini_api_key:
     name: "Gemini API Key"
-    description: "API key from Google AI Studio used for LLM inference."
+    description: "API key from Google AI Studio, used by tasks with provider 'gemini' (the default)."
   gemini_model:
     name: "Default Gemini Model"
-    description: "Global fallback model identifier (e.g. gemini-3.5-flash-lite)."
+    description: "Model for Gemini tasks without their own 'model:' (e.g. gemini-3.5-flash-lite)."
+  audit_archive:
+    name: "Audit Archive"
+    description: "Save prompt, response, values and attachments of each LLM task as a .tar.gz audit archive. A task can opt out with 'audit: false'. When disabled, no archives are written at all."
+  timezone:
+    name: "Time Zone"
+    description: "Optional IANA time zone (e.g. 'Europe/Berlin') for timestamps, prompts and time series. Leave empty to use the time zone configured in Home Assistant."
+  datetime_format:
+    name: "Date/Time Format"
+    description: "strftime format for the {now} prompt placeholder and target sensor history entries (default: %d.%m.%Y %H:%M:%S)."
   mqtt_host:
     name: "MQTT Host"
     description: "Hostname or IP of the MQTT broker (e.g. 'core-mosquitto' for the HA add-on)."
