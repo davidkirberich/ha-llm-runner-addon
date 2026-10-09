@@ -43,12 +43,13 @@ Changes to `llm_tasks.yaml` are picked up on the next run. When you save the fil
 
 The add-on adds **LLM Runner** to the Home Assistant sidebar. It shows:
 
-- **Tasks**: status, duration and errors of the last run. Every task can be run from here, also without an MQTT connection. **Details** opens the task below the list with three tabs:
+- **Tasks**: every task by its ID from `llm_tasks.yaml`, with status, duration and errors of the last run. Every task can be run from here, also without an MQTT connection. **New** asks for a task ID, appends a task with only a short example `prompt` to `llm_tasks.yaml` and opens its **Config** tab. **Details** opens the task below the list with three tabs:
   - **Details**: the last result and the last prompt.
   - **Memory**: the task's memory, with **Clear memory**.
-  - **Config**: the entities, files and URLs the task reads, with the name and current value from Home Assistant (missing and `unavailable` entities are marked), and the task's other settings. **Find an entity** searches all Home Assistant entities by ID or name; **Copy** puts a line like `grid_power: sensor.grid_power` on the clipboard to paste into the task's `entities:` in the **llm_tasks.yaml** tab.
+  - **Config**: the entities, files and URLs the task reads, with the name and current value from Home Assistant (missing and `unavailable` entities are marked; a click on an entity ID opens its Home Assistant dialog with history and activity), and below it the **Task YAML**: the whole task as written in `llm_tasks.yaml` (prompt, provider, `entities`, `files`, `urls`, `hours`, …, including comments). You can copy it into a chat assistant such as ChatGPT, refine it there and paste it back. The entity table always follows the text in the editor, also while you type; when the text is not valid YAML, the table is greyed out. **Add an entity** searches all Home Assistant entities by ID or name; **Add** puts the entity with the alias from the input field (for example `grid_power: sensor.grid_power`) into the task's `entities:` in the editor, and **Remove** takes an entity, file or URL out again. Use the alias as `{grid_power}` in the prompt. Nothing is written until you click **Save** (or press Ctrl+S). A green ✓ / red ✗ shows whether the text is valid YAML (only the syntax, a click on ✗ jumps to the line). **Save** replaces the task in `llm_tasks.yaml` and leaves the rest of the file, including comments, as it is; like the **llm_tasks.yaml** tab it refuses to save when the resulting file would have errors (for example `hours: abc`), and keeps the previous version as `llm_tasks.yaml.bak`. **Preview** (or Ctrl+Enter in the editor) runs the text in the editor once as it is, without saving it: entities and history are read, the processor runs, the prompt is built and sent to the LLM. The result appears below the editor with the duration and the prompt as sent, or the error with its traceback. A preview writes nothing: no memory entry, no audit archive, no `target_sensor` and no MQTT update (the existing memory is used for `{history}`). Every preview is a real LLM call and costs tokens; **Run now** still runs the saved task normally.
+  - **Remove** (red, next to **Run now**) deletes the task after a confirmation: it is taken out of `llm_tasks.yaml` (backup in `llm_tasks.yaml.bak`), its sensor disappears from Home Assistant, and its memory and all of its audit archives are deleted.
 - **llm_tasks.yaml**: an editor with validation. Saving checks the YAML first, warns about unknown keys and missing processors, and keeps the previous version as `llm_tasks.yaml.bak`.
-- **Processors**: create, edit and delete processor scripts. Saving checks the Python syntax.
+- **Processors**: create, edit and delete processor scripts. **Validate** checks a script without running it: it must compile, define `process(df, config)`, and every module it imports must be installed in the add-on (imports inside `try:` are skipped, since they are usually optional). Saving does the same checks; only syntax errors prevent saving.
 - **Audit**: browse, view, download and delete audit archives, including the attached images.
 
 The web interface is only reachable through Home Assistant (Ingress) and is available to administrators only. Processors are Python code that runs inside the add-on, so treat access to the add-on like admin access to Home Assistant.
@@ -107,7 +108,7 @@ tasks:
       living_room: sensor.living_room_temperature
       humidity: sensor.living_room_humidity
       outdoor: sensor.outdoor_temperature
-    hours: 48          # history window loaded automatically (default: 24)
+    hours: 48          # history window loaded automatically (default: 0)
     resample: 2h       # average per 2 hours -> 24 rows per entity (default: 1h)
     temperature: 0.2
     prompt: |
@@ -211,7 +212,8 @@ For an Echo announcement, add a second action with your Alexa notify service (e.
 
 #### Notes
 
-- The password is stored in plain text in `llm_tasks.yaml`, so use a dedicated view-only camera user. Special characters must be URL-encoded (`@` becomes `%40`).
+- The password is stored in plain text in `llm_tasks.yaml` and shown as written in the web interface (admins only), so use a dedicated view-only camera user. The add-on log shows it as `***@`. Special characters must be URL-encoded (`@` becomes `%40`).
+- A `camera.*` entity needs no password in `llm_tasks.yaml` at all; prefer it when it delivers reliable stills.
 - Any other camera works the same way: use a `camera.*` entity or its snapshot URL under `entities:`.
 - Want the message in German? Add `Answer in German.` to the prompt.
 
@@ -239,7 +241,7 @@ Built-in date and time placeholders use Home Assistant's time zone and language 
 
 An entry under `entities:` (or a processor metric) with the same name, e.g. `month`, takes precedence over the built-in placeholder.
 
-If history was loaded (`hours:` greater than 0 and at least one plain entity) or a processor returned data, but the prompt uses neither `{timeseries}` nor `{data}`, the time series is appended to the prompt as a `MEASUREMENTS (JSON)` block. Set `hours: 0` if a task doesn't need the history.
+If history was loaded (`hours:` greater than 0 and at least one plain entity) or a processor returned data, but the prompt uses neither `{timeseries}` nor `{data}`, the time series is appended to the prompt as a `MEASUREMENTS (JSON)` block. Omit `hours` or set `hours: 0` if a task doesn't need entity history. This does not affect `{history}`, which contains previous task answers.
 
 Literal braces must be doubled (`{{` / `}}`). If the prompt references an unknown placeholder, it is sent unformatted with the current values (and the time series) appended instead.
 
@@ -276,7 +278,7 @@ tasks:
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `hours` | int | `24` | History window loaded from the recorder for the entities. `0` disables history. |
+| `hours` | int | `0` | History window loaded from the recorder for the entities. Only an explicitly configured positive value loads history; omitted or `0` disables entity history. Current entity values and previous task answers (`{history}`) are unaffected. |
 | `resample` | string | `1h` | Bucket size for averaging the history ([pandas offset](https://pandas.pydata.org/docs/user_guide/timeseries.html#offset-aliases), e.g. `15min`, `2h`, `1D`). The result goes into `{timeseries}`, or is appended to the prompt if the prompt doesn't use it. |
 | `data_processor` | string | - | Custom Python script that replaces the default aggregation (see below). Searched in the add-on's `processors/` folder first, then in the pre-1.4.0 locations (`/config/scripts/processors` and `/config` of Home Assistant); the `.py` suffix is optional, so `solar_forecast` is enough. If the script fails, the default aggregation is used. |
 | `processor` | string | - | Alias of `data_processor`. |
@@ -294,7 +296,7 @@ def process(df, config):
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `prompt` | string | - | Prompt template with placeholders (see above). Without a prompt, no LLM is called and the task only publishes the collected values (and processor data). |
+| `prompt` | string | - | Prompt template with placeholders (see above). Without a prompt, no LLM is called and the task only publishes the collected values (and processor data); camera images and `files` are then not loaded. |
 | `provider` | string | `gemini` | LLM provider (see *LLM providers* below). |
 | `model` | string | provider option, e.g. `gemini_model` | Model for this task, overriding the add-on option. |
 | `temperature` | float | `0.0` | Sampling temperature. |

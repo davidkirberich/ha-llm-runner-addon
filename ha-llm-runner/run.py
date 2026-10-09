@@ -12,6 +12,7 @@ import shutil
 import string
 import threading
 import time
+import traceback
 from urllib.parse import urlparse, unquote
 from datetime import datetime, timezone, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -216,18 +217,26 @@ def prompt_fields(prompt: str) -> set[str]:
         return set()
     return {re.split(r"[.\[]", field, maxsplit=1)[0] for _, field, _, _ in parsed if field}
 
+URL_CREDENTIALS = re.compile(r"(?<=://)[^/@\s]+@")
+
+
+def redact_url(text) -> str:
+    """Replaces `user:pass@` in any URL inside the text with `***@` (for logs and error messages)."""
+    return URL_CREDENTIALS.sub("***@", str(text))
+
+
 def fetch_external_url(url: str, max_chars: int = 15000) -> str:
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         text = r.text
         if len(text) > max_chars:
-            logger.warning(f"Payload from {url} was truncated (> {max_chars} chars)")
+            logger.warning(f"Payload from {redact_url(url)} was truncated (> {max_chars} chars)")
             return text[:max_chars] + "\n... [TRUNCATED]"
         return text
     except Exception as e:
-        logger.warning(f"Fetch of external URL {url} failed: {e}")
-        return f"ERROR: {e}"
+        logger.warning(redact_url(f"Fetch of external URL {url} failed: {e}"))
+        return redact_url(f"ERROR: {e}")
 
 
 def fetch_ha_states() -> list[dict]:
@@ -795,8 +804,8 @@ def write_ha_target_state(task_config: dict, result_payload: dict, options: dict
         logger.warning(f"Could not push task result to HA state {target_sensor}: {e}")
 
 
-def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: dict):
-    logger.info(f"--- Executing Task: {task_id} ---")
+def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: dict, dry_run: bool = False):
+    logger.info(f"--- {'Previewing' if dry_run else 'Executing'} Task: {task_id} ---")
 
     metrics = {}
     images = []
@@ -824,22 +833,26 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
         camera_entities = {}
         calendar_entities = {}
 
+    # Images and files only go to the LLM; a data-only task (no prompt) doesn't need to download them
+    custom_prompt = task_config.get("prompt")
+    if not custom_prompt:
+        camera_entities = {}
     for key, cam_target in camera_entities.items():
         try:
             b64_data, mime_type = fetch_camera_snapshot(str(cam_target))
             images.append((b64_data, mime_type))
             loaded_image_names.append(key)
         except Exception as e:
-            logger.warning(f"Camera snapshot for {cam_target} failed: {e}")
+            logger.warning(redact_url(f"Camera snapshot for {cam_target} failed: {e}"))
 
-    file_entities = task_config.get("files", {}) or {}
+    file_entities = (task_config.get("files", {}) or {}) if custom_prompt else {}
     for key, target_url in file_entities.items():
         try:
             b64_data, mime_type = fetch_binary_file(str(target_url))
             images.append((b64_data, mime_type))
             loaded_file_names.append(f"{key} ({mime_type})")
         except Exception as e:
-            logger.warning(f"Loading file {target_url} failed: {e}")
+            logger.warning(redact_url(f"Loading file {target_url} failed: {e}"))
 
     for key, cal_id in calendar_entities.items():
         try:
@@ -851,7 +864,7 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
     for key, spec in sensor_entities.items():
         metrics[key] = fetch_ha_state(str(spec))
 
-    hours = int(task_config.get("hours", 24))
+    hours = int(task_config.get("hours", 0))
     sensor_history_map = {k: str(v).split(":", 1)[0] for k, v in sensor_entities.items()}
     if sensor_history_map and hours > 0:
         raw_data = fetch_ha_data(list(sensor_history_map.values()), hours)
@@ -894,7 +907,6 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
 
     metrics_payload = processor_metrics if processor_metrics is not None else metrics.copy()
 
-    custom_prompt = task_config.get("prompt")
     json_schema = task_config.get("response_schema")
 
     if custom_prompt:
@@ -946,6 +958,15 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
             "data": parsed_data
         }
 
+    outcome = {
+        "prompt": formatted_prompt if custom_prompt else "",
+        "result": result_payload,
+        "attachments": loaded_image_names + loaded_file_names,
+    }
+    # A preview stops here: no audit archive, no memory, no Home Assistant state, nothing published
+    if dry_run:
+        return outcome
+
     audit_enabled = bool(options.get("audit_archive", True)) and task_config.get("audit", bool(custom_prompt))
     if audit_enabled:
         try:
@@ -965,11 +986,20 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
     else:
         logger.warning(f"MQTT not connected, result of task '{task_id}' was not published.")
     logger.info(f"Task '{task_id}' finished successfully.")
-    return {
-        "prompt": formatted_prompt if custom_prompt else "",
-        "result": result_payload,
-        "attachments": loaded_image_names + loaded_file_names,
-    }
+    return outcome
+
+
+def preview_task(task_id: str, task_config: dict, options: dict) -> dict:
+    """Runs a (possibly unsaved) task configuration without saving or publishing anything; errors are returned, not raised."""
+    with _run_lock:
+        started = time.monotonic()
+        try:
+            outcome = execute_task(task_id, task_config, None, options, dry_run=True) or {}
+            return {"ok": True, **outcome, "duration": round(time.monotonic() - started, 2)}
+        except Exception as e:
+            logger.warning(redact_url(f"Preview of task '{task_id}' failed: {type(e).__name__}: {e}"))
+            return {"ok": False, "error": redact_url(f"{type(e).__name__}: {e}"), "traceback": redact_url(traceback.format_exc()),
+                    "duration": round(time.monotonic() - started, 2)}
 
 
 def task_status(task_id: str) -> dict:

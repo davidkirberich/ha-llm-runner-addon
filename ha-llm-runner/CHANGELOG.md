@@ -5,11 +5,25 @@
 ### Added
 
 - Web interface: each task has a **Details** button next to **Run**. It opens the task below the list with the tabs **Details** (last result and prompt), **Memory** and **Config**.
-- **Config** tab: lists the entities, files and URLs a task reads with name and current value from Home Assistant, so typos and `unavailable` sensors stand out. Below it, a search over all Home Assistant entities copies a ready-made `alias: entity_id` line for `llm_tasks.yaml`.
+- **Config** tab: lists the entities, files and URLs a task reads with name and current value from Home Assistant, so typos and `unavailable` sensors stand out. A click on an entity ID opens the entity's Home Assistant dialog. Below it, a search over all Home Assistant entities adds an entity with an editable alias to the task's `entities:`; **Remove** takes an entity, file or URL out again.
+- **Config** tab: **Task YAML** shows the whole task as written in `llm_tasks.yaml` (including entities, files, URLs and comments) and can be edited directly, e.g. to copy it into a chat assistant and paste the refined version back. The entity table follows the editor text live, **Add**/**Remove** only change the editor text, and **Save** writes the task. A ✓ / ✗ shows live whether the YAML syntax is valid; saving keeps the rest of `llm_tasks.yaml` unchanged, refuses results with errors and saves the previous version as `llm_tasks.yaml.bak`.
+- **Config** tab: **Preview** (or Ctrl+Enter in the Task YAML) runs the unsaved task text once and shows the result, the duration and the prompt as sent, or the error with traceback, below the editor. It is a real LLM call, but writes no memory, no audit archive, no `target_sensor` and publishes nothing via MQTT.
+- Tasks tab: **New** creates a task with only an example `prompt` (no `name`) and opens its **Config** tab. A red **Remove** in the task details deletes a task after a confirmation, together with its Home Assistant sensor, its memory and its audit archives.
+- Processors tab: **Validate** checks a processor without running it (compiles, has `process(df, config)`, all imported modules are installed). Saving runs the same checks and shows problems as warnings.
 
 ### Changed
 
+- Entity history is now opt-in: an omitted `hours` defaults to `0` instead of `24`, in both normal runs and Preview. Set `hours` to a positive number to include recorder history; current entity values and task memory (`{history}`) are unchanged.
 - Clicking a task row no longer opens the task; use **Details**.
+- The task list and the task details show the task ID from `llm_tasks.yaml` instead of `name` (`name` is still the name of the sensor in Home Assistant).
+- Processors tab: the list shows only the file name and how many tasks use it; the task names are shown above the editor.
+- Task details and preview: free-text answers are shown as readable text; the full result (with the duplicate `text`/`summary` attributes and `updated_at`) is folded away under "Raw result".
+
+### Fixed
+
+- Passwords in camera, file and URL targets (`user:pass@`) no longer appear in the add-on log or in error texts passed to the LLM; they are shown as `***@`. The **Config** tab shows the targets exactly as written in `llm_tasks.yaml` (the web interface is for Home Assistant admins only).
+- Saving or previewing a task in the **Config** tab no longer fails with "could not be put back into llm_tasks.yaml unchanged" when its last multi-line value (e.g. `prompt: |`) is followed by an indented, otherwise empty line. Such a line belonged to the value in YAML; it is now removed when the task is saved. The same error no longer appears when the task text ends without a final line break.
+- A task without `prompt` (data-only, no LLM call) no longer downloads its camera images and `files`, they were never used. The configuration check warns about them, and **Preview** shows "No prompt" with a hint instead of a green "OK".
 
 ## 1.4.1 (2026-10-09)
 

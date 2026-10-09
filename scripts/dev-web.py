@@ -179,9 +179,12 @@ def main():
     runner.OPTIONS_PATH = os.path.join(CONFIG_DIR, "options.json")
     runner._ha_config = {}
 
-    def simulated_task(task_id, task_config, client, options):
+    def simulated_task(task_id, task_config, client, options, dry_run=False):
         time.sleep(2)
-        return {"prompt": str(task_config.get("prompt", "")), "result": f"(dev) simulated answer of '{task_id}'"}
+        if "simulate error" in str(task_config.get("prompt", "")):
+            raise RuntimeError("(dev) simulated failure, because the prompt contains 'simulate error'")
+        answer = f"(dev) simulated answer of '{task_id}'\nSecond line."
+        return {"prompt": str(task_config.get("prompt", "")), "result": {"text": answer, "summary": answer, "updated_at": "2026-01-05T07:00:00+01:00"}}
 
     runner.execute_task = simulated_task
     runner.fetch_ha_states = lambda: SAMPLE_STATES

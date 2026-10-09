@@ -2,6 +2,7 @@ import json
 
 import pandas as pd
 import pytest
+import requests
 
 import llm_providers
 import run as runner
@@ -148,6 +149,50 @@ def test_execute_task_routes_prompt_images_and_temperature_through_provider(task
     assert written["summary"] == "All good"
 
 
+def test_preview_runs_the_llm_but_saves_and_publishes_nothing(task_env, monkeypatch):
+    published, written = task_env
+    audits = []
+    monkeypatch.setattr(runner, "create_audit_archive", lambda *args, **kwargs: audits.append(args))
+    runner.append_memory("demo", "Yesterday", {})
+    task_cfg = {"provider": "recording", "prompt": "Temp {temp}, before: {history}", "entities": {"temp": "sensor.outdoor"},
+                "target_sensor": "sensor.llm_result", "audit": True}
+
+    outcome = runner.preview_task("demo", task_cfg, {"recording_api_key": "k"})
+
+    assert outcome["ok"] is True
+    assert outcome["prompt"].startswith("Temp 21.5, before: Yesterday")
+    assert outcome["result"]["state"] == "ok" and outcome["result"]["summary"] == "All good"
+    assert isinstance(outcome["duration"], float)
+    assert published == {} and written == {} and audits == []
+    assert [entry["text"] for entry in runner.load_memory("demo")] == ["Yesterday"]
+    assert "demo" not in runner.TASK_STATUS
+
+
+def test_data_only_task_does_not_download_images_or_files(task_env, monkeypatch):
+    def unexpected(target):
+        raise AssertionError(f"downloaded {target}")
+    monkeypatch.setattr(runner, "fetch_camera_snapshot", unexpected)
+    monkeypatch.setattr(runner, "fetch_binary_file", unexpected)
+    task_cfg = {"entities": {"temp": "sensor.outdoor", "cam": "camera.front_door"}, "files": {"webcam": "http://cam/x.jpg"}}
+
+    outcome = runner.preview_task("demo", task_cfg, {})
+
+    assert outcome["ok"] is True and outcome["prompt"] == "" and outcome["attachments"] == []
+    assert outcome["result"]["temp"] == "21.5" and RecordingProvider.requests == []
+
+def test_preview_returns_errors_with_traceback(task_env, monkeypatch):
+    def broken(spec):
+        raise ConnectionError("http://user:secret@cam.local/snap failed")
+    monkeypatch.setattr(runner, "fetch_ha_state", broken)
+
+    outcome = runner.preview_task("demo", {"provider": "recording", "prompt": "{t}", "entities": {"t": "sensor.x"}}, {"recording_api_key": "k"})
+
+    assert outcome["ok"] is False
+    assert outcome["error"].startswith("ConnectionError: ")
+    assert "Traceback" in outcome["traceback"] and "broken" in outcome["traceback"]
+    assert "secret" not in outcome["error"] + outcome["traceback"]
+
+
 def test_execute_task_uses_global_model_and_gemini_by_default(task_env, monkeypatch):
     calls = []
 
@@ -184,6 +229,26 @@ def test_split_url_credentials_moves_userinfo_into_digest_auth():
     assert url == "http://192.168.1.5:8080/snap.jpg"
     assert (auth.username, auth.password) == ("admin", "p@ss")
     assert runner.split_url_credentials("https://example.com/a.mp3") == ("https://example.com/a.mp3", None)
+
+
+def test_redact_url_hides_credentials_in_any_url():
+    text = "Snapshot for http://admin:p%40ss@cam.local/snap.jpg failed: 401 for url https://u:pw@nas/x"
+
+    assert runner.redact_url(text) == "Snapshot for http://***@cam.local/snap.jpg failed: 401 for url https://***@nas/x"
+    assert runner.redact_url("https://example.com/a@b") == "https://example.com/a@b"
+
+
+def test_failed_downloads_never_log_credentials(monkeypatch, caplog):
+    def boom(*args, **kwargs):
+        raise requests.ConnectionError("Max retries exceeded with url: http://admin:topsecret@cam.local/snap.jpg")
+
+    monkeypatch.setattr(runner.requests, "get", boom)
+
+    with caplog.at_level("WARNING"):
+        result = runner.fetch_external_url("http://admin:topsecret@cam.local/data")
+
+    assert "topsecret" not in caplog.text and "topsecret" not in result
+    assert "***@cam.local" in caplog.text
 
 
 def test_fetch_binary_file_reads_local_file_relative_to_config(monkeypatch, tmp_path):
@@ -482,7 +547,8 @@ def test_execute_task_falls_back_to_default_aggregation_when_processor_missing(t
     monkeypatch.setattr(runner, "fetch_ha_data", lambda entities, hours: [[
         {"entity_id": "sensor.pv", "state": "4.0", "last_changed": "2026-01-01T10:00:00+00:00"},
     ]])
-    task_cfg = {"provider": "recording", "data_processor": "missing.py", "entities": {"pv": "sensor.pv"}, "prompt": "{timeseries}"}
+    task_cfg = {"provider": "recording", "data_processor": "missing.py", "entities": {"pv": "sensor.pv"},
+                "hours": 24, "prompt": "{timeseries}"}
 
     runner.execute_task("demo", task_cfg, client=None, options={"recording_api_key": "k"})
 
@@ -517,23 +583,32 @@ def test_execute_task_appends_history_json_when_prompt_has_no_series_placeholder
 @pytest.mark.parametrize("prompt", ["{timeseries}", "Data: {data}"])
 def test_execute_task_does_not_append_history_twice(task_env, monkeypatch, prompt):
     monkeypatch.setattr(runner, "fetch_ha_data", _two_point_history)
-    task_cfg = {"provider": "recording", "entities": {"outside": "sensor.outside"}, "prompt": prompt}
+    task_cfg = {"provider": "recording", "entities": {"outside": "sensor.outside"}, "hours": 24, "prompt": prompt}
 
     runner.execute_task("demo", task_cfg, client=None, options={"recording_api_key": "k"})
 
     assert "MEASUREMENTS" not in RecordingProvider.requests[0].prompt
 
 
-def test_execute_task_appends_nothing_without_history(task_env):
-    task_cfg = {"provider": "recording", "entities": {"outside": "sensor.outside"}, "hours": 0, "prompt": "Outside {outside}."}
+@pytest.mark.parametrize("history_settings", [{}, {"hours": 0}])
+@pytest.mark.parametrize("preview", [False, True])
+def test_execute_task_appends_nothing_without_history(task_env, monkeypatch, history_settings, preview):
+    requested = []
+    monkeypatch.setattr(runner, "fetch_ha_data", lambda entities, hours: requested.append((entities, hours)) or [])
+    task_cfg = {"provider": "recording", "entities": {"outside": "sensor.outside"},
+                "prompt": "Outside {outside}.", **history_settings}
 
-    runner.execute_task("demo", task_cfg, client=None, options={"recording_api_key": "k"})
+    if preview:
+        assert runner.preview_task("demo", task_cfg, {"recording_api_key": "k"})["ok"] is True
+    else:
+        runner.execute_task("demo", task_cfg, client=None, options={"recording_api_key": "k"})
 
+    assert requested == []
     assert RecordingProvider.requests[0].prompt == "Outside 21.5."
 
 
 def test_execute_task_reports_missing_history_to_the_model(task_env):
-    task_cfg = {"provider": "recording", "entities": {"outside": "sensor.outside"}, "prompt": "Outside {outside}."}
+    task_cfg = {"provider": "recording", "entities": {"outside": "sensor.outside"}, "hours": 24, "prompt": "Outside {outside}."}
 
     runner.execute_task("demo", task_cfg, client=None, options={"recording_api_key": "k"})
 
