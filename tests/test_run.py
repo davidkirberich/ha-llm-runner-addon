@@ -704,10 +704,11 @@ def test_run_task_records_status_prompt_and_result(task_env):
     assert runner.task_status("unknown") == {"state": "idle"}
 
 
-def test_on_connect_runs_all_tasks_only_once(monkeypatch, storage):
+def test_on_connect_publishes_discovery_without_running_tasks(monkeypatch, storage):
     storage["TASKS_CONFIG_PATH"].write_text("tasks:\n  a:\n    prompt: x\n", encoding="utf-8")
     runs, discovered = [], []
     monkeypatch.setattr(runner, "run_all_tasks_async", lambda client, options: runs.append(1))
+    monkeypatch.setattr(runner, "run_task_async", lambda *args: runs.append(1))
     monkeypatch.setattr(runner, "publish_task_discovery", lambda client, task_id, cfg: discovered.append(task_id))
 
     class FakeClient:
@@ -718,7 +719,7 @@ def test_on_connect_runs_all_tasks_only_once(monkeypatch, storage):
     runner.on_connect(client, None, None, 0)
     runner.on_connect(client, None, None, 0)
 
-    assert runs == [1]
+    assert runs == []
     assert discovered == ["a", "a"]
     assert runner.MQTT_STATUS["connected"] is True
 

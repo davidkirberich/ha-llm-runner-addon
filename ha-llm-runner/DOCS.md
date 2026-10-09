@@ -28,9 +28,8 @@ Upgrading from 1.3.x? Your files are copied to the new location automatically on
 
 ## How tasks work
 
-Tasks live in `llm_tasks.yaml` under a top-level `tasks:` key. For each task, the add-on creates a sensor (named after `name:`) and a **Run** button. A task runs:
+Tasks live in `llm_tasks.yaml` under a top-level `tasks:` key. For each task, the add-on creates a sensor (named after `name:`) and a **Run** button. Tasks never run on their own, not even when the add-on starts. A task runs:
 
-- once when the add-on starts,
 - when its button is pressed,
 - when **Run** is clicked in the web UI,
 - when any message is published to `ha_llm_runner/run/<task_id>`,

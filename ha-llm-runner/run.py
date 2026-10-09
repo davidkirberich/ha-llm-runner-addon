@@ -1033,10 +1033,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
         tasks = load_tasks()
         for task_id, task_cfg in tasks.items():
             publish_task_discovery(client, task_id, task_cfg)
-        # Run everything once per container start only, not again after every broker reconnect
-        if not MQTT_STATUS.get("initial_run_done"):
-            MQTT_STATUS["initial_run_done"] = True
-            run_all_tasks_async(client, load_options())
     else:
         MQTT_STATUS.update({"connected": False, "error": f"connection refused (code {rc})"})
         logger.error(f"MQTT connection failed with code {rc}")

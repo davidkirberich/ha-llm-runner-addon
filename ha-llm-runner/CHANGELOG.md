@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 (2026-10-09)
+
+### Changed
+
+- Tasks no longer run when the add-on starts. They only run when triggered (button, web interface or MQTT), so restarts and updates cause no LLM calls and no extra memory entries. The sensors keep their last value across restarts.
+
 ## 1.4.0 (2026-10-09)
 
 Existing `llm_tasks.yaml` files keep working unchanged. Your files are moved to the add-on's own folder automatically (see *Changed*).
