@@ -171,6 +171,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\deploy-local.ps1 -HostName ho
 
 `-CheckOnly` only tests the connection. The local add-on (slug `local_ha_llm_runner`) has its own config folder. Stop the GitHub-installed version while testing, because both use the same MQTT topics and entities.
 
+To go back to the store version:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy-local.ps1 -Remove -Transfer
+```
+
+`-Remove` uninstalls the local add-on. `-Transfer` first updates the store version if needed, then copies the local add-on's `llm_tasks.yaml`, `processors/`, `memory/`, `audit/` and options to it. It stops without changing anything if the store version already has an `llm_tasks.yaml`. Without `-Transfer`, the local add-on's config folder is kept.
+
 ---
 
 ## License

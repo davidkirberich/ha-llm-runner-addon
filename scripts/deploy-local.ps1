@@ -11,15 +11,26 @@
 
 .EXAMPLE
     .\scripts\deploy-local.ps1 -HostName 192.168.10.5
+    -Remove uninstalls the local add-on again. With -Transfer, its files
+    (llm_tasks.yaml, processors/, memory/, audit/) and options are first copied
+    to the version installed from the add-on store, which is updated if needed.
+
+.EXAMPLE
+    .\scripts\deploy-local.ps1 -HostName 192.168.10.5
 .EXAMPLE
     .\scripts\deploy-local.ps1 -CheckOnly
+.EXAMPLE
+    .\scripts\deploy-local.ps1 -Remove -Transfer
 #>
 param(
     [string]$HostName = "homeassistant.local",
     [string]$User = "root",
     [int]$Port = 22,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$Remove,
+    [switch]$Transfer
 )
+if ($Transfer -and -not $Remove) { throw "-Transfer is only used together with -Remove." }
 
 $ErrorActionPreference = "Stop"
 $source = Join-Path $PSScriptRoot "..\ha-llm-runner" | Resolve-Path
@@ -44,6 +55,57 @@ if ($LASTEXITCODE -ne 0 -or -not $base) {
 $target = "$($base.Trim())/$folder"
 Write-Host "Connection OK. Target: $target"
 if ($CheckOnly) { return }
+
+if ($Remove) {
+    # Sent via stdin, so double quotes and $variables reach bash unchanged; tr drops the CRs PowerShell adds.
+    $removeScript = @'
+set -e
+if ha apps --help >/dev/null 2>&1; then CLI=apps; else CLI=addons; fi
+for d in /app_configs /addon_configs; do if [ -d "$d" ]; then CONFIGS=$d; break; fi; done
+info() { ha $CLI info "$1" --raw-json; }
+if ! info __SLUG__ >/dev/null 2>&1 || [ "$(info __SLUG__ | jq -r '.data.version // empty')" = "" ]; then
+  echo "The local add-on is not installed."
+  NOT_INSTALLED=1
+fi
+if [ "__TRANSFER__" = "1" ] && [ -z "$NOT_INSTALLED" ]; then
+  STORE=$(ha $CLI --raw-json | jq -r '.data.addons[] | select(.slug | endswith("___FOLDER__")) | select(.slug != "__SLUG__") | .slug' | head -1)
+  [ -n "$STORE" ] || { echo "No store version of the add-on is installed. Install it first, or omit -Transfer."; exit 1; }
+  echo "Transferring to $STORE ..."
+  if [ "$(info $STORE | jq -r '.data.update_available')" = "true" ]; then
+    ha $CLI stop $STORE >/dev/null 2>&1 || true
+    ha $CLI update $STORE
+  fi
+  ha $CLI stop __SLUG__ >/dev/null 2>&1 || true
+  ha $CLI stop $STORE >/dev/null 2>&1 || true
+  SRC=$CONFIGS/__SLUG__; DST=$CONFIGS/$STORE
+  if [ -e "$DST/llm_tasks.yaml" ]; then
+    echo "$DST already contains llm_tasks.yaml; nothing was copied or removed. Move it away and run again."
+    exit 1
+  fi
+  mkdir -p "$DST"
+  cp -a "$SRC"/. "$DST"/
+  rm -rf "$DST"/processors/__pycache__
+  echo "Copied $(ls "$SRC" | tr '\n' ' ')to $DST"
+  info __SLUG__ | jq '{options: .data.options}' | curl -sf -X POST \
+    -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" \
+    -d @- "http://supervisor/addons/$STORE/options" >/dev/null
+  echo "Options copied. Start $STORE in Home Assistant when ready."
+  REMOVE_CONFIG=--remove-config
+fi
+if [ -z "$NOT_INSTALLED" ]; then
+  ha $CLI stop __SLUG__ >/dev/null 2>&1 || true
+  ha $CLI uninstall __SLUG__ $REMOVE_CONFIG
+fi
+rm -rf __TARGET__ __TARGET__.new
+ha store reload >/dev/null 2>&1 || ha $CLI reload >/dev/null
+echo "Local add-on removed."
+'@
+    $removeScript = $removeScript.Replace("__SLUG__", $slug).Replace("__FOLDER__", $folder).
+        Replace("__TARGET__", $target).Replace("__TRANSFER__", [string][int][bool]$Transfer)
+    $removeScript | ssh @sshArgs $remote "tr -d '\r' | bash -s"
+    if ($LASTEXITCODE -ne 0) { throw "Removing failed. See the output above." }
+    return
+}
 
 $archive = Join-Path ([IO.Path]::GetTempPath()) "ha_llm_runner_deploy.tar.gz"
 try {
