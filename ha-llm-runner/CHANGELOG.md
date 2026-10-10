@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.2 (2026-10-10)
+
+### Changed
+
+- `llm_tasks.yaml` and the processor editor have a Discard button.
+- Validation messages appear below the editor buttons, so Save and Delete no longer move.
+- Clicking a task row no longer opens its details; use the Details button.
+
 ## 1.5.1 (2026-10-10)
 
 ### Changed

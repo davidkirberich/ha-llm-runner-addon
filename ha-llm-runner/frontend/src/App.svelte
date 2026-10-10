@@ -110,10 +110,6 @@
     void revealDetails();
     try { await loadDetail(id); } catch (reason) { report(reason); }
   }
-  function rowClick(event: MouseEvent, id: string) {
-    if ((event.target as HTMLElement).closest('button, a, input')) return;
-    void select(id);
-  }
 
   const drafts = $derived(settingsDirty || configDirty || processorDirty);
   const fileBusy = $derived(pending || configWorking || processorWorking);
@@ -241,9 +237,7 @@
           <thead><tr><th>Task</th><th>Status</th><th>Last run</th><th>Memory</th><th>Actions</th></tr></thead>
           <tbody>
             {#each overview.tasks as task (task.id)}
-              <!-- The Details button is the keyboard-accessible equivalent of a row click. -->
-              <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
-              <tr class="clickable" class:selected={selected === task.id} onclick={(event) => rowClick(event, task.id)}>
+              <tr class:selected={selected === task.id}>
                 <td>
                   <strong class="mono">{task.id}</strong>
                   <div class="muted">

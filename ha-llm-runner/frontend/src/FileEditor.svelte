@@ -79,6 +79,12 @@
     isNew = true;
     usedBy = []; errors = []; warnings = []; notice = '';
   }
+  function discard() {
+    if (busy || !dirty || !confirm('Discard your unsaved changes?')) return;
+    if (isNew) { name = ''; baseline = ''; isNew = false; }
+    text = baseline;
+    errors = []; warnings = []; notice = '';
+  }
   async function perform(save: boolean) {
     if (busy || (save && blocked) || (kind === 'processors' && !name)) return;
     busy = true;
@@ -190,10 +196,11 @@
       <span class="grow"></span>
       <span class="muted">Line {cursor.line}, column {cursor.column}</span>
       <button class="secondary" disabled={busy} onclick={() => perform(false)}>Validate</button>
-      {#if notice}<span role="status">{notice}</span>{/if}
+      <button class="secondary" disabled={busy || !dirty} onclick={discard}>Discard</button>
       <button disabled={busy || blocked} onclick={() => perform(true)}>{busy ? 'Working...' : dirty ? 'Save *' : 'Save'}</button>
       {#if kind === 'processors'}<button class="danger" disabled={busy || isNew || blocked} onclick={remove}>Delete</button>{/if}
     </div>
+    {#if notice}<p class="status-line" role="status">{notice}</p>{/if}
   {:else}
     <p class="muted">Select a processor from the list or create a new one.</p>
   {/if}
