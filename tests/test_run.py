@@ -117,7 +117,8 @@ def task_env(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "create_audit_archive", lambda *args, **kwargs: None)
 
     published = {}
-    monkeypatch.setattr(runner, "_mqtt_client", object())
+    from types import SimpleNamespace
+    monkeypatch.setattr(runner, "_mqtt_client", SimpleNamespace(publish=lambda *args, **kwargs: None))
     monkeypatch.setattr(runner, "publish_task_state", lambda client, task_id, data: published.update({task_id: data}))
     written = {}
     monkeypatch.setattr(runner, "write_ha_target_state", lambda cfg, data, options=None, memory=None: written.update(data))
@@ -543,16 +544,16 @@ def test_execute_task_runs_processor_once_from_processors_dir(task_env, monkeypa
     assert prompt == 'Forecast 12.5 kWh. Data: [{"hour": 12, "kwh": 3.1}]. Series: [{"hour": 12, "kwh": 3.1}]'
 
 
-def test_execute_task_falls_back_to_default_aggregation_when_processor_missing(task_env, monkeypatch):
+def test_execute_task_stops_before_provider_when_processor_missing(task_env, monkeypatch):
     monkeypatch.setattr(runner, "fetch_ha_data", lambda entities, hours: [[
         {"entity_id": "sensor.pv", "state": "4.0", "last_changed": "2026-01-01T10:00:00+00:00"},
     ]])
     task_cfg = {"provider": "recording", "data_processor": "missing.py", "entities": {"pv": "sensor.pv"},
                 "hours": 24, "prompt": "{timeseries}"}
 
-    runner.execute_task("demo", task_cfg, client=None, options={"recording_api_key": "k"})
-
-    assert json.loads(RecordingProvider.requests[0].prompt)[0]["pv"] == 4.0
+    with pytest.raises(FileNotFoundError, match="missing.py"):
+        runner.execute_task("demo", task_cfg, client=None, options={"recording_api_key": "k"})
+    assert RecordingProvider.requests == []
 
 
 def _two_point_history(entities, hours):
@@ -787,7 +788,9 @@ def test_on_connect_publishes_discovery_without_running_tasks(monkeypatch, stora
     monkeypatch.setattr(runner, "publish_task_discovery", lambda client, task_id, cfg: discovered.append(task_id))
 
     class FakeClient:
-        def subscribe(self, topic):
+        def subscribe(self, topic, qos=0):
+            pass
+        def publish(self, *args, **kwargs):
             pass
 
     client = FakeClient()
@@ -803,7 +806,7 @@ def test_sync_task_discovery_removes_deleted_tasks(monkeypatch):
     published = []
 
     class FakeClient:
-        def publish(self, topic, payload, retain=False):
+        def publish(self, topic, payload, retain=False, qos=0):
             published.append((topic, payload))
 
     monkeypatch.setattr(runner, "publish_task_discovery", lambda client, task_id, cfg: published.append(("add", task_id)))

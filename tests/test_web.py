@@ -83,7 +83,7 @@ def test_overview_lists_tasks_status_and_config_problems(server, storage):
     data = requests.get(server + "api/overview", timeout=5).json()
 
     task = data["tasks"][0]
-    assert task["id"] == "menu" and task["name"] == "Menu" and task["llm"] is True
+    assert task["id"] == "menu" and "name" not in task and task["llm"] is True
     assert task["memory_entries"] == 1
     assert task["status"]["state"] == "ok"
     assert "last_prompt" not in task["status"]
@@ -95,7 +95,7 @@ def test_task_detail_run_and_clear_memory(server, storage, monkeypatch):
     write_tasks(storage, "tasks:\n  menu:\n    prompt: x\n")
     runner.append_memory("menu", "Pasta", {})
     started = []
-    monkeypatch.setattr(runner, "run_task_async", lambda task_id, cfg, client, options, inputs=None: started.append(task_id))
+    monkeypatch.setattr(runner, "run_task_async", lambda task_id, cfg, client, options, inputs=None: started.append(task_id) or object())
 
     detail = requests.get(server + "api/tasks/menu", timeout=5).json()
     assert detail["memory"][0]["text"] == "Pasta"

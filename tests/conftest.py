@@ -38,4 +38,7 @@ def storage(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "TASK_STATUS", {})
     monkeypatch.setattr(run, "MQTT_STATUS", {"connected": False})
     monkeypatch.setattr(run, "_mqtt_client", None)
+    monkeypatch.setattr(run, "_active_invocations", {})
+    monkeypatch.setattr(run, "_completed_invocations", run.OrderedDict())
+    monkeypatch.setattr(run, "_task_lifecycle", {})
     return paths

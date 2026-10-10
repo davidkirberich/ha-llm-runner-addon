@@ -25,10 +25,17 @@ Or add `https://github.com/davidkirberich/ha-llm-runner-addon` manually under **
 - **Audit Archives (optional):** Each LLM task stores its prompt, response, values and attachments as a `.tar.gz` archive, kept for `audit_retention_days` (default 30) and excluded from backups. Turn this off globally with the add-on option `audit_archive: false`, or per task with `audit: false`.
 - **Time Zone, Language and Date Format:** Timestamps, time series and the `{now}` / `{today}` / `{weekday}` / `{month}` prompt placeholders use the time zone and language configured in Home Assistant. Override them with the add-on options `timezone` (e.g. `Europe/Berlin`) and `language` (e.g. `de`), and change the `{now}` / history format with `datetime_format` (default `%d.%m.%Y %H:%M:%S`).
 - **Custom Local Processors:** Allows to integrate custom preprocessing pipelines from the add-on's `processors/` folder before feeding data to the LLM.
+- **Optional Home Assistant Action:** The [companion integration](https://github.com/davidkirberich/ha-llm-runner-hacs) adds `llm_runner.execute` to run a task, wait for its own completion and return the result directly to an automation. The add-on remains fully usable without it; correlated MQTT lifecycle messages are also available for direct use.
 
 ---
 
 ## Architecture
+
+Manual builds installed with `scripts/deploy-local.ps1` are labelled
+`<version>-preview.<commit>`, with `.dirty` appended for uncommitted changes.
+Only the uploaded add-on manifest is changed; the repository release version stays
+unchanged. The label distinguishes a manually deployed build from a store release,
+regardless of which Git branch supplied it.
 
 ```text
 [ Home Assistant Core ] 
@@ -196,4 +203,4 @@ This uninstalls the local add-on together with its configuration. Then start the
 ---
 
 ## License
-This project is licensed under the GNU General Public License v3.0.
+Starting with release 1.5.0, this project is licensed under the [MIT License](LICENSE). Previously published releases keep their original license.

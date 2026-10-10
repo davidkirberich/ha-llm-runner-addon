@@ -174,7 +174,7 @@ def test_rest_uses_same_invocation_validation(config, monkeypatch):
     with pytest.raises(web.ApiError, match="Missing required"):
         app.run_task("test", body={})
     recorded = []
-    monkeypatch.setattr(run, "run_task_async", lambda *args: recorded.append(args))
+    monkeypatch.setattr(run, "run_task_async", lambda *args: recorded.append(args) or object())
     monkeypatch.setattr(run, "load_options", lambda: {})
     assert app.run_task("test", body=payload())[0] == 202
     assert recorded[0][-1] == payload()

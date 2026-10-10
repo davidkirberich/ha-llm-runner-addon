@@ -43,7 +43,7 @@ PROCESSOR_NAME = re.compile(r"^[A-Za-z0-9_\-]+\.py$")
 AUDIT_NAME = re.compile(r"^audit_(?P<task>.+)_(?P<stamp>\d{8}_\d{6})\.tar\.gz$")
 TEXT_SUFFIXES = (".txt", ".md", ".json", ".csv", ".yaml", ".yml")
 KNOWN_TASK_KEYS = {
-    "name", "icon", "state_template", "unit_of_measurement", "device_class", "state_class",
+    "icon", "state_template", "unit_of_measurement", "device_class", "state_class",
     "entities", "files", "urls", "hours", "resample", "data_processor", "processor",
     "prompt", "provider", "model", "temperature", "response_schema", "history_limit",
     "target_sensor", "friendly_name", "audit", "inputs", "validate_response",
@@ -579,7 +579,6 @@ class WebApp:
             status.pop("last_prompt", None)
             tasks.append({
                 "id": task_id,
-                "name": cfg.get("name", task_id),
                 "icon": cfg.get("icon", "mdi:brain"),
                 "llm": bool(cfg.get("prompt")),
                 "provider": cfg.get("provider"),
@@ -631,9 +630,11 @@ class WebApp:
     def run_task(self, task_id, body=None, **_):
         cfg = self.task_or_404(task_id)
         try:
-            self.runner.run_task_async(task_id, cfg, self.runner._mqtt_client, self.runner.load_options(), body)
+            thread = self.runner.run_task_async(task_id, cfg, self.runner._mqtt_client, self.runner.load_options(), body)
         except (ValueError, OSError) as e:
             raise ApiError(400, str(e)) from e
+        if thread is None:
+            return 200, {"queued": [], "duplicate": True}
         return 202, {"queued": [task_id]}
 
     def preview_task(self, task_id, body, **_):
@@ -758,7 +759,7 @@ class WebApp:
     def delete_task(self, task_id, **_):
         runner = self.runner
         self.task_or_404(task_id)
-        if runner.task_status(task_id).get("state") in ("queued", "running"):
+        if runner.task_busy(task_id) or runner.task_status(task_id).get("state") in ("queued", "running"):
             raise ApiError(409, f"Task '{task_id}' is running right now, try again when it is done.")
         result = self.change_tasks_text(lambda text: remove_task_from_text(text, task_id))
         runner.clear_memory(task_id)

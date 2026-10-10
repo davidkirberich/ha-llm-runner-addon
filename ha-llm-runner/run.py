@@ -14,6 +14,8 @@ import threading
 import time
 import traceback
 import copy
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from urllib.parse import urlparse, unquote
 from datetime import datetime, timezone, timedelta, tzinfo
@@ -62,6 +64,121 @@ _mqtt_client = None
 _run_lock = threading.Lock()
 TASK_STATUS: dict[str, dict] = {}
 MQTT_STATUS = {"connected": False}
+PROTOCOL_VERSION = 1
+SESSION_ID = uuid.uuid4().hex
+EVENT_TOPIC = "ha_llm_runner/events"
+AVAILABILITY_TOPIC = "ha_llm_runner/availability"
+CATALOG_TOPIC = "ha_llm_runner/tasks"
+_invocation_lock = threading.RLock()
+_active_invocations: dict[str, "Invocation"] = {}
+_completed_invocations: OrderedDict[str, None] = OrderedDict()
+_task_lifecycle: dict[str, dict] = {}
+
+
+@dataclass
+class Invocation:
+    task_id: str
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    request_id: str | None = None
+    queued_at: str | None = None
+    started_at: str | None = None
+
+
+def validate_invocation_metadata(payload: dict):
+    if "run_id" in payload and (not isinstance(payload["run_id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", payload["run_id"])):
+        raise ValueError("run_id must contain 1-128 letters, digits, underscores or hyphens.")
+    if "request_id" in payload and (not isinstance(payload["request_id"], str)
+            or not payload["request_id"].strip() or len(payload["request_id"]) > 4096):
+        raise ValueError("request_id must be a non-empty string, at most 4096 characters.")
+
+
+def invocation_context(task_id: str, payload: dict | None = None) -> Invocation:
+    payload = {} if payload is None else payload
+    if not isinstance(payload, dict):
+        raise ValueError("Task invocation must be a JSON object.")
+    validate_invocation_metadata(payload)
+    return Invocation(task_id, payload.get("run_id", uuid.uuid4().hex), payload.get("request_id"))
+
+
+def publish_protocol(client, topic: str, payload: dict, *, retain: bool):
+    client = client or _mqtt_client
+    if client is None:
+        logger.warning("MQTT unavailable; could not publish %s.", topic)
+        return
+    info = client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=1, retain=retain)
+    if info is not None and info.rc != mqtt.MQTT_ERR_SUCCESS:
+        logger.error("MQTT publish to %s failed (code %s).", topic, info.rc)
+
+
+def publish_availability(client, state: str):
+    publish_protocol(client, AVAILABILITY_TOPIC,
+                     {"protocol": PROTOCOL_VERSION, "session_id": SESSION_ID, "state": state}, retain=True)
+
+
+def publish_task_catalog(client, tasks: dict):
+    publish_protocol(client, CATALOG_TOPIC, {
+        "protocol": PROTOCOL_VERSION, "session_id": SESSION_ID,
+        "tasks": [{"task_id": task_id} for task_id in tasks],
+    }, retain=True)
+
+
+def publish_lifecycle(client, invocation: Invocation, state: str, **details):
+    payload = {"protocol": PROTOCOL_VERSION, "session_id": SESSION_ID,
+               "task_id": invocation.task_id, "run_id": invocation.run_id, "state": state,
+               "queued_at": invocation.queued_at, **details}
+    if invocation.started_at is not None:
+        payload["started_at"] = invocation.started_at
+    if invocation.request_id is not None:
+        payload["request_id"] = invocation.request_id
+    # Serialize state updates and their publishes, including reconnect snapshots.
+    with _invocation_lock:
+        _task_lifecycle[invocation.task_id] = payload
+        publish_protocol(client, f"ha_llm_runner/status/{invocation.task_id}", payload, retain=True)
+        publish_protocol(client, EVENT_TOPIC, payload, retain=False)
+
+
+def reserve_invocation(invocation: Invocation) -> bool:
+    with _invocation_lock:
+        if invocation.run_id in _active_invocations or invocation.run_id in _completed_invocations:
+            logger.warning("Ignoring duplicate run_id '%s'.", invocation.run_id)
+            return False
+        _active_invocations[invocation.run_id] = invocation
+        return True
+
+
+def finish_invocation(invocation: Invocation):
+    with _invocation_lock:
+        _active_invocations.pop(invocation.run_id, None)
+        _completed_invocations[invocation.run_id] = None
+        while len(_completed_invocations) > 256:
+            _completed_invocations.popitem(last=False)
+
+
+def task_busy(task_id: str) -> bool:
+    with _invocation_lock:
+        return any(call.task_id == task_id for call in _active_invocations.values())
+
+
+def reject_invocation(task_id: str, payload, client, options: dict, error: Exception):
+    try:
+        invocation = invocation_context(task_id, payload)
+    except ValueError:
+        # Preserve a usable correlation ID even when other metadata is invalid.
+        metadata = payload if isinstance(payload, dict) else {}
+        run_id = metadata.get("run_id")
+        invocation = Invocation(task_id, run_id if isinstance(run_id, str)
+                                and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id) else uuid.uuid4().hex)
+    if reserve_invocation(invocation):
+        invocation.queued_at = local_now(options).isoformat()
+        message = invocation_error(error, options)
+        finished_at = local_now(options).isoformat()
+        TASK_STATUS.setdefault(task_id, {}).update({
+            "state": "error", "error": message, "run_id": invocation.run_id,
+            "queued_at": invocation.queued_at, "finished_at": finished_at, "duration": 0,
+        })
+        publish_lifecycle(client, invocation, "error", error=message, finished_at=finished_at, duration=0)
+        finish_invocation(invocation)
 
 
 @dataclass
@@ -118,8 +235,9 @@ def validate_inputs_config(task_config: dict):
 def prepare_task_inputs(task_config: dict, payload: dict | None = None) -> TaskInputs:
     validate_inputs_config(task_config)
     payload = {} if payload is None else payload
-    if not isinstance(payload, dict) or set(payload) - {"files", "variables"}:
-        raise ValueError("Task invocation must contain only files and variables.")
+    if not isinstance(payload, dict) or set(payload) - {"files", "variables", "run_id", "request_id"}:
+        raise ValueError("Task invocation must contain only files, variables, run_id and request_id.")
+    validate_invocation_metadata(payload)
     files, variables = payload.get("files", {}), payload.get("variables", {})
     if not isinstance(files, dict) or not isinstance(variables, dict):
         raise ValueError("Invocation files and variables must be mappings.")
@@ -321,6 +439,17 @@ URL_CREDENTIALS = re.compile(r"(?<=://)[^/@\s]+@")
 def redact_url(text) -> str:
     """Replaces `user:pass@` in any URL inside the text with `***@` (for logs and error messages)."""
     return URL_CREDENTIALS.sub("***@", str(text))
+
+
+def invocation_error(error: Exception, options: dict) -> str:
+    text = redact_url(f"{type(error).__name__}: {error}")
+    text = re.sub(r"(?i)([?&](?:key|api_key|token|access_token)=)[^&\s]+", r"\1***", text)
+    for key, value in options.items():
+        if key.endswith(("_key", "_token", "_password")) and isinstance(value, str) and value:
+            text = text.replace(value, "***")
+    if SUPERVISOR_TOKEN:
+        text = text.replace(SUPERVISOR_TOKEN, "***")
+    return text[:4096]
 
 
 def fetch_external_url(url: str, max_chars: int = 15000) -> str:
@@ -782,7 +911,7 @@ def publish_task_discovery(client: mqtt.Client, task_id: str, task_config: dict)
 
     # 1. Sensor Discovery
     sensor_payload = {
-        "name": task_config.get("name", f"LLM {task_id.replace('_', ' ').title()}"),
+        "name": task_id,
         "unique_id": f"llm_runner_{clean_id}",
         "state_topic": state_topic,
         "value_template": primary_state_template,
@@ -796,10 +925,10 @@ def publish_task_discovery(client: mqtt.Client, task_id: str, task_config: dict)
 
     client.publish(sensor_config_topic, json.dumps(sensor_payload), retain=True)
 
-    # 2. Button Discovery (creates button.run_<name> in Home Assistant)
+    # 2. Button Discovery (creates button.run_<task_id> in Home Assistant)
     button_config_topic = f"homeassistant/button/llm_run_{clean_id}/config"
     button_payload = {
-        "name": f"Run {task_config.get('name', task_id)}",
+        "name": f"Run {task_id}",
         "unique_id": f"llm_button_{clean_id}",
         "command_topic": f"ha_llm_runner/run/{task_id}",
         "payload_press": "RUN",
@@ -823,12 +952,16 @@ def remove_task_discovery(client: mqtt.Client, task_id: str):
         f"homeassistant/sensor/llm_{clean_id}/config",
         f"homeassistant/sensor/llm_{clean_id}/state",
         f"homeassistant/button/llm_run_{clean_id}/config",
+        f"ha_llm_runner/status/{task_id}",
     ):
         client.publish(topic, "", retain=True)
 
 
 def sync_task_discovery(old_tasks: dict, new_tasks: dict, client: mqtt.Client | None = None):
     """Applies an edited llm_tasks.yaml to Home Assistant without restarting the add-on."""
+    with _invocation_lock:
+        for task_id in set(old_tasks) - set(new_tasks):
+            _task_lifecycle.pop(task_id, None)
     client = client or _mqtt_client
     if client is None:
         return
@@ -836,6 +969,18 @@ def sync_task_discovery(old_tasks: dict, new_tasks: dict, client: mqtt.Client | 
         remove_task_discovery(client, task_id)
     for task_id, task_cfg in new_tasks.items():
         publish_task_discovery(client, task_id, task_cfg)
+    publish_task_catalog(client, new_tasks)
+    publish_status_snapshot(client, new_tasks)
+
+
+def publish_status_snapshot(client, tasks: dict):
+    with _invocation_lock:
+        for task_id in tasks:
+            payload = _task_lifecycle.setdefault(task_id, {
+                "protocol": PROTOCOL_VERSION, "session_id": SESSION_ID,
+                "task_id": task_id, "state": "idle",
+            })
+            publish_protocol(client, f"ha_llm_runner/status/{task_id}", payload, retain=True)
 
 
 def processor_candidates(path_value: str) -> list[str]:
@@ -982,14 +1127,10 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
     processor_metrics = None
     raw_data = None
     if processor_name:
-        try:
-            processor_metrics, raw_data = run_processor(processor_name, df, task_config)
-            metrics.update(processor_metrics or {})
-            if raw_data is not None:
-                timeseries_data = raw_data if isinstance(raw_data, str) else json.dumps(raw_data, ensure_ascii=False, default=str)
-        except Exception as e:
-            logger.warning(f"Custom processor failed for task '{task_id}', using default aggregation: {e}")
-            processor_name, processor_metrics, raw_data = None, None, None
+        processor_metrics, raw_data = run_processor(processor_name, df, task_config)
+        metrics.update(processor_metrics or {})
+        if raw_data is not None:
+            timeseries_data = raw_data if isinstance(raw_data, str) else json.dumps(raw_data, ensure_ascii=False, default=str)
     if not processor_name:
         if df.empty:
             if sensor_history_map and hours > 0:
@@ -1120,13 +1261,27 @@ def task_status(task_id: str) -> dict:
 
 
 def run_task(task_id: str, task_config: dict, client: mqtt.Client | None, options: dict,
-             inputs: dict | None = None) -> bool:
+             inputs: dict | None = None, *, invocation: Invocation | None = None) -> bool:
     """Runs one task with status tracking. Tasks run one at a time, whoever triggers them (MQTT, UI, start-up)."""
+    if invocation is None:
+        try:
+            invocation = invocation_context(task_id, inputs)
+        except ValueError as e:
+            reject_invocation(task_id, inputs, client, options, e)
+            TASK_STATUS.setdefault(task_id, {}).update({"state": "error", "error": invocation_error(e, options)})
+            return False
+        if not reserve_invocation(invocation):
+            return False
+        invocation.queued_at = local_now(options).isoformat()
+        publish_lifecycle(client, invocation, "triggered")
     status = TASK_STATUS.setdefault(task_id, {})
-    status.update({"state": "queued", "queued_at": local_now(options).isoformat()})
+    status.update({"state": "queued", "queued_at": invocation.queued_at, "run_id": invocation.run_id})
     with _run_lock:
         started = time.monotonic()
-        status.update({"state": "running", "started_at": local_now(options).isoformat(), "error": None})
+        invocation.started_at = local_now(options).isoformat()
+        status.update({"state": "running", "started_at": invocation.started_at,
+                       "run_id": invocation.run_id, "error": None})
+        publish_lifecycle(client, invocation, "running")
         try:
             outcome = execute_task(task_id, task_config, client, options, inputs=inputs) or {}
             status.update({
@@ -1135,26 +1290,63 @@ def run_task(task_id: str, task_config: dict, client: mqtt.Client | None, option
                 "last_result": outcome.get("result"),
                 "attachments": outcome.get("attachments", []),
             })
+            publish_lifecycle(client, invocation, "ok", result=outcome.get("result", {}),
+                              finished_at=local_now(options).isoformat(),
+                              duration=round(time.monotonic() - started, 2))
             return True
         except Exception as e:
-            logger.exception(f"Error executing task '{task_id}': {e}")
-            status.update({"state": "error", "error": f"{type(e).__name__}: {e}"})
+            error = invocation_error(e, options)
+            logger.error("Error executing task '%s': %s", task_id, error)
+            status.update({"state": "error", "error": error})
+            publish_lifecycle(client, invocation, "error", error=error,
+                              finished_at=local_now(options).isoformat(),
+                              duration=round(time.monotonic() - started, 2))
             return False
         finally:
             status.update({
                 "finished_at": local_now(options).isoformat(),
                 "duration": round(time.monotonic() - started, 2),
             })
+            finish_invocation(invocation)
 
 
 def run_task_async(task_id: str, task_config: dict, client: mqtt.Client | None, options: dict,
-                   inputs: dict | None = None) -> threading.Thread:
+                   inputs: dict | None = None) -> threading.Thread | None:
     # Off the MQTT network loop: an LLM call can take a minute and would otherwise stall keep-alives
     task_config, inputs = copy.deepcopy(task_config), copy.deepcopy(inputs)
-    prepare_task_inputs(task_config, inputs)
+    try:
+        invocation = invocation_context(task_id, inputs)
+    except ValueError as e:
+        reject_invocation(task_id, inputs, client, options, e)
+        raise
+    if not reserve_invocation(invocation):
+        return None
+    invocation.queued_at = local_now(options).isoformat()
+    try:
+        prepare_task_inputs(task_config, inputs)
+    except (ValueError, OSError) as e:
+        error = invocation_error(e, options)
+        finished_at = local_now(options).isoformat()
+        TASK_STATUS.setdefault(task_id, {}).update({
+            "state": "error", "error": error, "run_id": invocation.run_id,
+            "queued_at": invocation.queued_at, "finished_at": finished_at, "duration": 0,
+        })
+        publish_lifecycle(client, invocation, "error", error=error, finished_at=finished_at, duration=0)
+        finish_invocation(invocation)
+        raise
+    publish_lifecycle(client, invocation, "triggered")
     TASK_STATUS.setdefault(task_id, {})["state"] = "queued"
-    thread = threading.Thread(target=run_task, args=(task_id, task_config, client, options, inputs), name=f"task-{task_id}", daemon=True)
-    thread.start()
+    thread = threading.Thread(target=run_task, args=(task_id, task_config, client, options, inputs),
+                              kwargs={"invocation": invocation}, name=f"task-{task_id}", daemon=True)
+    try:
+        thread.start()
+    except RuntimeError as e:
+        error = invocation_error(e, options)
+        TASK_STATUS.setdefault(task_id, {}).update({"state": "error", "error": error})
+        publish_lifecycle(client, invocation, "error", error=error,
+                          finished_at=local_now(options).isoformat(), duration=0)
+        finish_invocation(invocation)
+        raise
     return thread
 
 
@@ -1169,10 +1361,28 @@ def run_all_tasks(client: mqtt.Client | None, options: dict):
 
 
 def run_all_tasks_async(client: mqtt.Client | None, options: dict) -> threading.Thread:
-    for task_id in load_tasks():
+    tasks = copy.deepcopy(load_tasks())
+    invocations = []
+    for task_id in tasks:
+        invocation = Invocation(task_id, queued_at=local_now(options).isoformat())
+        reserve_invocation(invocation)
+        invocations.append(invocation)
+        publish_lifecycle(client, invocation, "triggered")
         TASK_STATUS.setdefault(task_id, {})["state"] = "queued"
-    thread = threading.Thread(target=run_all_tasks, args=(client, options), name="run-all", daemon=True)
-    thread.start()
+    def run_batch():
+        for invocation in invocations:
+            run_task(invocation.task_id, tasks[invocation.task_id], client, options, invocation=invocation)
+    thread = threading.Thread(target=run_batch, name="run-all", daemon=True)
+    try:
+        thread.start()
+    except RuntimeError as e:
+        for invocation in invocations:
+            error = invocation_error(e, options)
+            TASK_STATUS.setdefault(invocation.task_id, {}).update({"state": "error", "error": error})
+            publish_lifecycle(client, invocation, "error", error=error,
+                              finished_at=local_now(options).isoformat(), duration=0)
+            finish_invocation(invocation)
+        raise
     return thread
 
 
@@ -1182,11 +1392,14 @@ def on_connect(client, userdata, flags, rc, properties=None):
         logger.info("Connected to MQTT Broker. Subscribing to trigger topics...")
         _mqtt_client = client
         MQTT_STATUS.update({"connected": True, "error": None})
-        client.subscribe("ha_llm_runner/run")
-        client.subscribe("ha_llm_runner/run/+")
+        client.subscribe("ha_llm_runner/run", qos=1)
+        client.subscribe("ha_llm_runner/run/+", qos=1)
         tasks = load_tasks()
         for task_id, task_cfg in tasks.items():
             publish_task_discovery(client, task_id, task_cfg)
+        publish_task_catalog(client, tasks)
+        publish_status_snapshot(client, tasks)
+        publish_availability(client, "online")
     else:
         MQTT_STATUS.update({"connected": False, "error": f"connection refused (code {rc})"})
         logger.error(f"MQTT connection failed with code {rc}")
@@ -1199,8 +1412,12 @@ def on_disconnect(client, userdata, *args):
 
 def on_message(client, userdata, msg):
     topic = msg.topic
-    payload = msg.payload.decode("utf-8").strip()
-    logger.info(f"Received MQTT trigger on {topic} (payload: '{payload}')")
+    try:
+        payload = msg.payload.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        logger.error("Rejected non-UTF-8 MQTT trigger on %s.", topic)
+        return
+    logger.info("Received MQTT trigger on %s.", topic)
 
     options = load_options()
     tasks = load_tasks()
@@ -1211,21 +1428,34 @@ def on_message(client, userdata, msg):
     elif payload and payload.lower() not in ("run", "all", "press", ""):
         target_task = payload
 
+    # Retained commands must never execute, including legacy RUN commands.
+    if getattr(msg, "retain", False):
+        error = ValueError("Retained invocation payloads are not allowed.")
+        logger.error("Rejected MQTT trigger on %s: %s", topic, error)
+        if target_task:
+            TASK_STATUS.setdefault(target_task, {}).update({"state": "error", "error": str(error)})
+            # Do not replay a retained completion using a stale caller's run_id.
+        return
     if target_task:
+        inputs = None
+        try:
+            if payload.startswith(("{", "[")):
+                inputs = json.loads(payload)
+        except ValueError as e:
+            reject_invocation(target_task, None, client, options, e)
+            TASK_STATUS.setdefault(target_task, {}).update({"state": "error", "error": str(e)})
+            return
         if target_task in tasks:
             try:
-                inputs = None
-                if payload.startswith(("{", "[")):
-                    if getattr(msg, "retain", False):
-                        raise ValueError("Retained invocation payloads are not allowed.")
-                    inputs = json.loads(payload)
                 run_task_async(target_task, tasks[target_task], client, options, inputs)
             except (ValueError, OSError) as e:
                 logger.error(f"Rejected invocation for '{target_task}': {e}")
                 TASK_STATUS.setdefault(target_task, {}).update({"state": "error", "error": str(e),
                                                                "finished_at": local_now(options).isoformat()})
         else:
-            logger.warning(f"Requested task '{target_task}' not found in llm_tasks.yaml.")
+            error = ValueError(f"Task '{target_task}' not found in llm_tasks.yaml.")
+            logger.warning("%s", error)
+            reject_invocation(target_task, inputs, client, options, error)
     else:
         run_all_tasks_async(client, options)
 
@@ -1285,11 +1515,18 @@ def main():
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     client.on_message = on_message
+    client.will_set(AVAILABILITY_TOPIC, json.dumps({
+        "protocol": PROTOCOL_VERSION, "session_id": SESSION_ID, "state": "offline",
+    }), qos=1, retain=True)
 
     logger.info(f"Connecting to MQTT Broker at {host}:{port}...")
     # Asynchronous connect + retry: the web UI stays usable while the broker is unreachable
     client.connect_async(host, port, 60)
-    client.loop_forever(retry_first_connection=True)
+    try:
+        client.loop_forever(retry_first_connection=True)
+    finally:
+        publish_availability(client, "offline")
+        client.disconnect()
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ Upgrading from 1.3.x? Your files are copied to the new location automatically on
 
 ## How tasks work
 
-Tasks live in `llm_tasks.yaml` under a top-level `tasks:` key. For each task, the add-on creates a sensor (named after `name:`) and a **Run** button. Tasks never run on their own, not even when the add-on starts. A task runs:
+Tasks live in `llm_tasks.yaml` under a top-level `tasks:` key. For each task, the add-on creates a sensor and a **Run** button, both named after the task ID (for example `sensor.morning_briefing` and `button.run_morning_briefing` for a new task `morning_briefing`). Tasks never run on their own, not even when the add-on starts. A task runs:
 
 - when its button is pressed,
 - when **Run** is clicked in the web UI,
@@ -94,7 +94,6 @@ Reads the current state of two entities, puts them into the prompt and stores th
 ```yaml
 tasks:
   morning_briefing:
-    name: "Morning Briefing"
     entities:
       outdoor: sensor.outdoor_temperature   # current state -> {outdoor}
       weather: weather.home                 # current state -> {weather}, e.g. "rainy"
@@ -112,8 +111,7 @@ The add-on loads the history of every entity from the Home Assistant recorder, a
 
 ```yaml
 tasks:
-  climate_analysis:
-    name: "Living Room Climate"
+  living_room_climate:
     entities:
       living_room: sensor.living_room_temperature
       humidity: sensor.living_room_humidity
@@ -162,7 +160,7 @@ automation:
     actions:
       - action: mqtt.publish
         data:
-          topic: ha_llm_runner/run/climate_analysis
+          topic: ha_llm_runner/run/living_room_climate
           payload: RUN
 ```
 
@@ -174,8 +172,7 @@ When someone rings, the add-on grabs a snapshot from a Hikvision door station vi
 
 ```yaml
 tasks:
-  doorbell:
-    name: "Front Door Visitor"
+  front_door_visitor:
     icon: mdi:doorbell-video
     entities:
       # A snapshot URL is attached as an image (user:password@ is supported)
@@ -206,7 +203,7 @@ automation:
     actions:
       - action: mqtt.publish
         data:
-          topic: ha_llm_runner/run/doorbell
+          topic: ha_llm_runner/run/front_door_visitor
           payload: RUN
       - wait_for_trigger:
           - trigger: state
@@ -255,6 +252,78 @@ If history was loaded (`hours:` greater than 0 and at least one plain entity) or
 
 Literal braces must be doubled (`{{` / `}}`). If the prompt references an unknown placeholder, it is sent unformatted with the current values (and the time series) appended instead.
 
+## Automations: run a task and receive its result
+
+The add-on works on its own: existing MQTT triggers, Run buttons and result sensors remain available.
+The [optional HA LLM Runner integration](https://github.com/davidkirberich/ha-llm-runner-hacs) adds a waiting Home Assistant action. It uses HA's existing MQTT integration; task settings and provider credentials stay in the add-on. Install the companion integration using its README instructions.
+
+With the integration installed, an automation can simply call:
+
+```yaml
+actions:
+  - action: llm_runner.execute
+    data:
+      task_id: weather_advisor
+      timeout: 180
+    response_variable: weather
+  - action: notify.send_message
+    target:
+      entity_id: notify.wohnzimmer_speak
+    data:
+      message: "{{ weather.result.text }}"
+```
+
+Use the answer field your task produces (`text`, `summary`, or your own schema field). The next step runs only after this call's result arrives. Errors stop the action instead of returning an old sensor value. The timeout includes waiting behind other tasks; it ends the wait, **not** the task. There are no automatic retries. The action also accepts `files`, `variables`, and an optional `request_id` label.
+
+### Direct MQTT use (no companion integration required)
+
+Publish to `ha_llm_runner/run/<task_id>` with `retain: false`. `RUN` still works. To identify an individual call, use JSON:
+
+```json
+{"run_id": "unique-call-123", "request_id": "morning-weather"}
+```
+
+- `run_id` is optional; the runner generates one if omitted. If supplied, use a unique value per call (1-128 letters, digits, `_` or `-`).
+- `request_id` is an optional, non-empty string up to 4096 characters. It is returned unchanged, never sent to the LLM. Labels may repeat; use `run_id` for correlation.
+- `files` and `variables` can be included in the same JSON, as described under [Inputs](#inputs). The Run HTTP endpoint accepts the same body.
+
+The runner publishes:
+
+| Topic | Retained | Contents |
+| --- | --- | --- |
+| `ha_llm_runner/status/<task_id>` | Yes | Latest task status: `idle`, `triggered`, `running`, `ok` or `error`. |
+| `ha_llm_runner/events` | No | Per-call transitions with `task_id`, `run_id`, optional `request_id` and timestamps. `ok` includes `result`; `error` includes `error`. |
+| `ha_llm_runner/availability` | Yes | Runner `online`/`offline` and process `session_id`. |
+| `ha_llm_runner/tasks` | Yes | Task IDs only, without prompts or credentials. Updated when tasks are saved in the UI. |
+
+`idle` means no run since this runner process started. `triggered` means accepted and waiting; `running` means execution started. `ok` means task execution completed, including data-only tasks, not just an LLM response. All new messages include `protocol: 1` and a `session_id` that changes when the runner restarts. Completion has `queued_at`, `started_at` (if execution started), `finished_at` and `duration` (execution seconds, excluding queue time).
+
+Example completion:
+
+```json
+{
+  "protocol": 1,
+  "session_id": "runner-process-id",
+  "task_id": "weather_advisor",
+  "run_id": "unique-call-123",
+  "request_id": "morning-weather",
+  "state": "ok",
+  "queued_at": "2026-10-10T07:55:00+02:00",
+  "started_at": "2026-10-10T07:55:00+02:00",
+  "finished_at": "2026-10-10T07:55:15+02:00",
+  "duration": 15,
+  "result": {"text": "A sunny morning."}
+}
+```
+
+Subscribe **before** sending the request, and match `task_id`, `run_id` and `session_id`. Do not use the retained latest task status to identify simultaneous calls. The companion integration handles this for you. Reconnect republishes current statuses, not `idle`, and does not replay completion events. Invalid inputs and unknown tasks return an error with the supplied `run_id` when it is valid; malformed JSON cannot be correlated.
+
+Commands use QoS 1 where supported; lifecycle messages use QoS 1, so duplicate delivery is possible. Duplicate `run_id` commands are ignored while active and for the last 256 completed calls in this process (without replaying replies). This is **not** persistent exactly-once execution: restart clears this cache. Never retain commands or automatically retry paid work after an uncertain outcome. A runner restart or lost connection may leave callers without a completion; the integration reports unavailability or timeout rather than resubmitting.
+
+The Run HTTP endpoint returns `202` for a new queued call, or `200` with `{"queued": [], "duplicate": true}` if that `run_id` was already seen.
+
+Only one runner should use these fixed topics on a broker. Preview produces no lifecycle messages. Existing sensor topics and result payloads are unchanged.
+
 ## Task reference
 
 Every key a task in `llm_tasks.yaml` can use. Only `prompt:` is needed for an LLM call; all other keys are optional.
@@ -269,7 +338,6 @@ tasks:
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `name` | string | `LLM <Task Id>` | Name of the sensor. The button is called `Run <name>`. |
 | `icon` | string | `mdi:brain` | Icon of the sensor. |
 | `state_template` | string | `state`, else `status`, else `summary`, else `OK` | Jinja `value_template` that picks the sensor state from the result JSON, e.g. `"{{ value_json.trend }}"`. All result fields are always available as attributes. |
 | `unit_of_measurement` | string | - | Passed to the discovered sensor, e.g. for a numeric `state_template`. |
@@ -346,7 +414,7 @@ Use the exact file path from the Folder Watcher event, not a search for the newe
 | --- | --- | --- | --- |
 | `hours` | int | `0` | History window loaded from the recorder for the entities. Only an explicitly configured positive value loads history; omitted or `0` disables entity history. Current entity values and previous task answers (`{history}`) are unaffected. |
 | `resample` | string | `1h` | Bucket size for averaging the history ([pandas offset](https://pandas.pydata.org/docs/user_guide/timeseries.html#offset-aliases), e.g. `15min`, `2h`, `1D`). The result goes into `{timeseries}`, or is appended to the prompt if the prompt doesn't use it. |
-| `data_processor` | string | - | Custom Python script that replaces the default aggregation (see below). Searched in the add-on's `processors/` folder first, then in the pre-1.4.0 locations (`/config/scripts/processors` and `/config` of Home Assistant); the `.py` suffix is optional, so `solar_forecast` is enough. If the script fails, the default aggregation is used. |
+| `data_processor` | string | - | Custom Python script that replaces the default aggregation (see below). Searched in the add-on's `processors/` folder first, then in the pre-1.4.0 locations (`/config/scripts/processors` and `/config` of Home Assistant); the `.py` suffix is optional, so `solar_forecast` is enough. If the script fails, the task stops with an error before calling the LLM. |
 | `processor` | string | - | Alias of `data_processor`. |
 
 A processor exports one function. It receives the raw history as a `pandas.DataFrame` (one column per entity key, an empty frame if no history was loaded) and the task config. It must return a dict of metrics, which become prompt placeholders, plus any JSON-serializable data, which becomes `{data}` and `{timeseries}`:

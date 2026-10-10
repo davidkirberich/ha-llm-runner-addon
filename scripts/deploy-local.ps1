@@ -90,6 +90,19 @@ echo "Local add-on removed."
     return
 }
 
+$repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$commit = git -C $repo rev-parse --short HEAD
+if ($LASTEXITCODE -ne 0) { throw "Could not determine deployment commit." }
+$changes = git -C $repo status --porcelain
+if ($LASTEXITCODE -ne 0) { throw "Could not determine worktree status." }
+$configText = Get-Content (Join-Path $source "config.yaml") -Raw
+if ($configText -notmatch '(?m)^version:\s*"(\d+\.\d+\.\d+)(?:[-+][^"]*)?"\s*$') {
+    throw "Expected a quoted SemVer version in config.yaml."
+}
+$previewVersion = "$($Matches[1])-preview.$($commit.Trim())"
+if ($changes) { $previewVersion += ".dirty" }
+Write-Host "Manual deployment version: $previewVersion"
+
 $archive = Join-Path ([IO.Path]::GetTempPath()) "ha_llm_runner_deploy.tar.gz"
 try {
     Write-Host "Packing $source ..."
@@ -107,6 +120,7 @@ finally {
 $deployScript = @'
 rm -rf __TARGET__.new && mkdir -p __TARGET__.new
 tar -xzf /tmp/ha_llm_runner_deploy.tar.gz -C __TARGET__.new
+sed -i 's/^version: .*/version: "__VERSION__"/' __TARGET__.new/config.yaml
 rm -f /tmp/ha_llm_runner_deploy.tar.gz
 rm -rf __TARGET__ && mv __TARGET__.new __TARGET__
 ha store reload >/dev/null 2>&1 || ha $CLI reload >/dev/null
@@ -147,7 +161,8 @@ else
   echo "WARNING: the options could not be copied. Set them in Home Assistant."
 fi
 echo "Stop $PROD before starting the local add-on: both write the same MQTT topics and sensors."
+echo "Installed version: __VERSION__"
 '@
 Write-Host "Building on Home Assistant (this can take several minutes) ..."
-Invoke-Remote $deployScript "Build failed. See the output above or the Supervisor log."
+Invoke-Remote ($deployScript.Replace("__VERSION__", $previewVersion)) "Build failed. See the output above or the Supervisor log."
 Write-Host "Done. The local add-on is stopped; start it under Settings > Add-ons > HA LLM Runner."

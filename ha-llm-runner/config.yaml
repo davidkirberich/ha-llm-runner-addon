@@ -1,6 +1,6 @@
 name: "HA LLM Runner"
 description: "LLM-powered data processor and predictor with pluggable AI providers and MQTT Discovery."
-version: "1.4.4"
+version: "1.5.0"
 slug: "ha_llm_runner"
 init: false
 arch:

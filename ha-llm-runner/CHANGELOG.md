@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.0 (2026-10-10)
+
+### Added
+
+- Tasks now report when they are waiting, running, finished or failed via MQTT. Each run has its own ID, and automations can attach an optional label (`request_id`).
+- An optional companion Home Assistant integration can run a task, wait for its completion and return the result directly to an automation. The add-on still works without the integration.
+
+### Changed
+
+- Starting with this release, the project uses the MIT License. Previously published releases keep their original license.
+- A failed custom Python processor now stops the task with an error instead of calling the LLM with fallback data.
+- Retained MQTT commands are ignored, including `RUN`, to prevent unwanted runs after reconnecting.
+- Tasks are identified only by their task ID. The `name` task setting is no longer used: the sensor and **Run** button are named after the task ID (`<task_id>`, `Run <task_id>`), and the validator reports a remaining `name:` as an unknown key. Existing entity IDs stay the same; only the displayed names change.
+
 ## 1.4.4 (2026-10-10)
 
 ### Added
