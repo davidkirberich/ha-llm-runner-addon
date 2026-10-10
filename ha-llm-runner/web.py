@@ -46,7 +46,7 @@ KNOWN_TASK_KEYS = {
     "name", "icon", "state_template", "unit_of_measurement", "device_class", "state_class",
     "entities", "files", "urls", "hours", "resample", "data_processor", "processor",
     "prompt", "provider", "model", "temperature", "response_schema", "history_limit",
-    "target_sensor", "friendly_name", "audit",
+    "target_sensor", "friendly_name", "audit", "inputs", "validate_response",
 }
 
 
@@ -456,6 +456,10 @@ def validate_tasks_text(runner, text: str) -> dict:
             errors.append({"line": None, "message": f"Task '{task_id}' must be a mapping of settings."})
             continue
         unknown = sorted(set(map(str, cfg)) - KNOWN_TASK_KEYS)
+        try:
+            runner.validate_inputs_config(cfg)
+        except ValueError as e:
+            errors.append({"line": None, "message": f"Task '{task_id}': invalid input/response policy: {e}"})
         if unknown:
             warnings.append(f"Task '{task_id}': unknown key(s) {', '.join(unknown)} (typo?).")
         processor = cfg.get("data_processor") or cfg.get("processor")
@@ -624,9 +628,12 @@ class WebApp:
             result["entities"] = self.entity_rows(cfg) if isinstance(cfg, dict) else None
         return result
 
-    def run_task(self, task_id, **_):
+    def run_task(self, task_id, body=None, **_):
         cfg = self.task_or_404(task_id)
-        self.runner.run_task_async(task_id, cfg, self.runner._mqtt_client, self.runner.load_options())
+        try:
+            self.runner.run_task_async(task_id, cfg, self.runner._mqtt_client, self.runner.load_options(), body)
+        except (ValueError, OSError) as e:
+            raise ApiError(400, str(e)) from e
         return 202, {"queued": [task_id]}
 
     def preview_task(self, task_id, body, **_):

@@ -95,7 +95,7 @@ def test_task_detail_run_and_clear_memory(server, storage, monkeypatch):
     write_tasks(storage, "tasks:\n  menu:\n    prompt: x\n")
     runner.append_memory("menu", "Pasta", {})
     started = []
-    monkeypatch.setattr(runner, "run_task_async", lambda task_id, cfg, client, options: started.append(task_id))
+    monkeypatch.setattr(runner, "run_task_async", lambda task_id, cfg, client, options, inputs=None: started.append(task_id))
 
     detail = requests.get(server + "api/tasks/menu", timeout=5).json()
     assert detail["memory"][0]["text"] == "Pasta"

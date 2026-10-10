@@ -47,7 +47,7 @@ The web interface uses Svelte 5 and TypeScript for all tabs: Tasks (including Ne
 
 Frontend sources are in `frontend/`. With Node.js 22.12+ installed, run `npm ci`, then `npm run build` there. The build writes static assets to `web/svelte/`; the add-on's Docker build performs this automatically in a separate Node build stage. Node is not included in the runtime image. Unbuilt development checkouts return an explicit HTTP 503 with build instructions. The former hand-written JavaScript UI has been removed.
 
-For local development, start `scripts/dev-web.py --port 8199` from the repository root (sample data only), then run `npm run dev` in `frontend/`. Vite proxies API calls to the sample backend. Use `npm run check` and `npm test` to validate the frontend. To test the production build, open `http://localhost:8199/`. Asset and API URLs remain relative for Home Assistant Ingress. The old `?ui=svelte` URL still serves the same interface for existing bookmarks.
+For local development, start `scripts/dev-web.py --port 8199` from the repository root (sample data only), then run `npm run dev` in `frontend/`. Vite proxies API calls to the sample backend. Use `npm run check` and `npm test` to validate the frontend. To test the production build, open `http://localhost:8199/`. Asset and API URLs remain relative for Home Assistant Ingress.
 
 ### Features
 
@@ -278,6 +278,62 @@ tasks:
 
 ### Inputs
 
+#### Files and variables supplied by an automation
+
+A Folder Watcher automation can send the path of each new image to the same task. There are two separate pieces:
+
+1. **Task settings:** which folder and variables the task is allowed to receive.
+2. **Trigger message:** the actual image path and variable values for this one run.
+
+The trigger never changes the saved task settings.
+
+**Minimal task example.** In a task's **Task YAML** editor, paste only this task content (without a `tasks:` wrapper or task ID). The example folder and names are placeholders; replace them with your own:
+
+```yaml
+inputs:
+  files:
+    image:
+      root: www/camera_uploads
+      extensions: [.jpg, .jpeg]
+  variables: [location, filename]
+prompt: "Describe the animals at {location} in {filename}."
+```
+
+Here, `image` is a freely chosen attachment alias, not a file path. `root` allows files only from `/config/www/camera_uploads` in Home Assistant. `variables` lists the values the automation must supply; `{location}` and `{filename}` insert them into the prompt. The `inputs` section declares permissions, while the actual file is supplied at run time.
+
+Invocation files are **required by default**, so `required: true` is unnecessary and omitted. Only add `required: false` if the task may run without that attachment.
+
+When editing the complete `llm_tasks.yaml` file instead, place this content beneath your task ID in the existing task mapping (for example `tasks: → image_analysis:`).
+
+**Trigger message.** Assuming the task ID is `image_analysis`, publish this JSON to `ha_llm_runner/run/image_analysis` with `retain: false`. Replace the example path with the exact path from the upload event:
+
+```json
+{
+  "files": {"image": "/config/www/camera_uploads/door_20261010_120000.jpeg"},
+  "variables": {"location": "Front door", "filename": "door_20261010_120000.jpeg"}
+}
+```
+
+The `image` alias and variable names must match the task settings. The same JSON body is accepted by `POST api/tasks/image_analysis/run`. All listed variables are required, non-empty strings. Input aliases must not collide with existing sources or built-in placeholders. Trigger payloads cannot override the prompt, model, provider or other settings.
+
+`root` is relative to Home Assistant's configuration directory. `/config/...` in a trigger is translated to the add-on's read-only `/homeassistant/...` mount. Canonical paths, including symlink targets, must stay under the allowed directory, and files must match its extensions, exist, be non-empty and fit the existing 20 MB limit. A missing/invalid invocation file fails before the LLM is called; unlike optional static attachments it is not silently skipped. Invocation variables are also added to the result after schema validation, so the model cannot invent the source filename or location. `input_files` records canonical attachment paths in results and audit metrics.
+
+**Optional structured answer.** The minimal example above returns a normal text answer. If the automation needs a boolean field instead, add the following at the same level as `prompt` in the task and adjust the prompt to ask whether an animal is visible:
+
+```yaml
+response_schema:
+  type: object
+  properties:
+    animal_detected:
+      type: boolean
+  required: [animal_detected]
+validate_response: true
+```
+
+The two uses of "required" are different: `required: false` in an input file policy makes the **attachment** optional; `required: [animal_detected]` in JSON Schema makes that **answer field** mandatory. `validate_response: true` checks the model's answer locally against this schema before publishing or writing memory. Negative answers such as `animal_detected: false` are still published normally. Filter notifications in the calling automation.
+
+Use the exact file path from the Folder Watcher event, not a search for the newest file. Each queued invocation holds its own context. Wait until the FTP upload has finished (for example use a `closed` event where supported); a `created` event alone does not guarantee a complete JPEG. Keep cooldowns and trigger filtering in HA. Use unique upload filenames; overwriting a pending file would change its contents before analysis. Existing `RUN`/button triggers still work for static tasks; tasks with required invocation inputs report an error if manually run, previewed or included in Run all without those inputs. Retained JSON invocation payloads are rejected to prevent replays on reconnect.
+
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `entities` | map `key: source` | - | Data sources, each available as `{key}` in the prompt. The source type is detected by its value: `sensor.x` (any entity) gives the current state, `sensor.x:attribute` gives one attribute, `calendar.x` gives the events of the next 14 days as text, and `camera.x` or an `http(s)://` URL attaches an image snapshot to the request. Snapshot URLs are fetched directly from the camera (`user:pass@` is sent as Digest auth, MJPEG streams are supported); prefer them when a `camera.x` entity doesn't deliver reliable stills, e.g. a Hikvision door station's `/ISAPI/Streaming/channels/101/picture`. Plain entities and attributes also feed the history (see `hours:`). A plain list of entity ids is accepted too (keys become `0`, `1`, ...; no camera/calendar detection). |
@@ -311,6 +367,7 @@ def process(df, config):
 | `model` | string | provider option, e.g. `gemini_model` | Model for this task, overriding the add-on option. |
 | `temperature` | float | `0.0` | Sampling temperature. |
 | `response_schema` | JSON schema | - | Forces a JSON answer of this shape (JSON Schema: `type`, `properties`, `required`, `enum`, `items`, `description`, ...). Every field becomes a sensor attribute. Without a schema, the answer is stored as `text` and `summary`. |
+| `validate_response` | bool | `false` | Locally validates the answer against `response_schema`; invalid answers fail without publishing or updating memory. |
 
 ### Output
 

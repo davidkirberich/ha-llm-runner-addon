@@ -13,6 +13,8 @@ import string
 import threading
 import time
 import traceback
+import copy
+from dataclasses import dataclass, field
 from urllib.parse import urlparse, unquote
 from datetime import datetime, timezone, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -24,6 +26,8 @@ import pandas as pd
 import paho.mqtt.client as mqtt
 from babel import Locale, UnknownLocaleError
 from babel.dates import format_date, format_skeleton, format_time
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 from llm_providers import LLMRequest, get_provider
 
@@ -58,6 +62,100 @@ _mqtt_client = None
 _run_lock = threading.Lock()
 TASK_STATUS: dict[str, dict] = {}
 MQTT_STATUS = {"connected": False}
+
+
+@dataclass
+class TaskInputs:
+    files: dict[str, str] = field(default_factory=dict)
+    variables: dict[str, str] = field(default_factory=dict)
+
+
+def validate_inputs_config(task_config: dict):
+    spec = task_config.get("inputs", {})
+    if not isinstance(spec, dict) or set(spec) - {"files", "variables"}:
+        raise ValueError("'inputs' must contain only files and variables.")
+    files = spec.get("files", {})
+    variables = spec.get("variables", [])
+    if not isinstance(files, dict) or not isinstance(variables, list):
+        raise ValueError("Input files must be a mapping and variables must be a list.")
+    names = list(files) + variables
+    reserved = {"weekday", "today", "date", "time", "month", "year", "now", "history",
+                "timeseries", "data", "metrics", "updated_at", "input_files"}
+    configured = set()
+    for key in ("entities", "files", "urls"):
+        if isinstance(task_config.get(key), dict):
+            configured.update(task_config[key])
+    if any(not isinstance(name, str) or not re.fullmatch(r"(?!\d+$)[A-Za-z0-9_]+", name)
+           or name in reserved or name in configured for name in names) or len(names) != len(set(names)):
+        raise ValueError("Input names must be unique aliases without reserved or configured source names.")
+    for name, policy in files.items():
+        if not isinstance(policy, dict) or set(policy) - {"root", "required", "extensions"}:
+            raise ValueError(f"Invalid policy for input file '{name}'.")
+        root = policy.get("root")
+        extensions = policy.get("extensions")
+        if (not isinstance(root, str) or not root or is_absolute(root)
+                or "\\" in root or ".." in root.split("/") or is_http_url(root)):
+            raise ValueError(f"Input '{name}' needs a relative Home Assistant root directory.")
+        if not isinstance(policy.get("required", True), bool):
+            raise ValueError(f"Input '{name}' required must be a boolean.")
+        if not isinstance(extensions, list) or not extensions or any(
+                not isinstance(ext, str) or not re.fullmatch(r"\.[A-Za-z0-9]+", ext) for ext in extensions):
+            raise ValueError(f"Input '{name}' needs an extensions list such as [.jpg, .jpeg].")
+    if (files or variables) and not task_config.get("prompt"):
+        raise ValueError("Invocation inputs require an LLM prompt.")
+    if not isinstance(task_config.get("validate_response", False), bool):
+        raise ValueError("validate_response must be a boolean.")
+    if task_config.get("validate_response"):
+        schema = task_config.get("response_schema")
+        if not isinstance(schema, dict):
+            raise ValueError("validate_response requires a response_schema.")
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as e:
+            raise ValueError(f"Invalid response_schema: {e.message}") from e
+
+
+def prepare_task_inputs(task_config: dict, payload: dict | None = None) -> TaskInputs:
+    validate_inputs_config(task_config)
+    payload = {} if payload is None else payload
+    if not isinstance(payload, dict) or set(payload) - {"files", "variables"}:
+        raise ValueError("Task invocation must contain only files and variables.")
+    files, variables = payload.get("files", {}), payload.get("variables", {})
+    if not isinstance(files, dict) or not isinstance(variables, dict):
+        raise ValueError("Invocation files and variables must be mappings.")
+    spec = task_config.get("inputs", {})
+    policies = spec.get("files", {})
+    allowed_variables = spec.get("variables", [])
+    if set(files) - set(policies) or set(variables) - set(allowed_variables):
+        raise ValueError("Invocation includes inputs not allowed by this task.")
+    missing = [name for name, policy in policies.items() if policy.get("required", True) and name not in files]
+    missing += [name for name in allowed_variables if name not in variables]
+    if missing:
+        raise ValueError(f"Missing required task inputs: {', '.join(missing)}.")
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 4096 for value in variables.values()):
+        raise ValueError("Invocation variables must be non-empty strings, at most 4096 characters.")
+    result = TaskInputs(variables=variables.copy())
+    ha_root = os.path.realpath(HA_CONFIG_DIR)
+    for name, target in files.items():
+        if not isinstance(target, str) or not target or "\x00" in target or is_http_url(target):
+            raise ValueError(f"Input '{name}' must be a local Home Assistant file path.")
+        if target.startswith(LEGACY_CONFIG_PREFIX):
+            target = os.path.join(HA_CONFIG_DIR, target[len(LEGACY_CONFIG_PREFIX):])
+        elif not is_absolute(target):
+            target = os.path.join(HA_CONFIG_DIR, target)
+        path = os.path.realpath(target)
+        root = os.path.realpath(os.path.join(HA_CONFIG_DIR, policies[name]["root"]))
+        if os.path.commonpath([ha_root, root]) != ha_root or os.path.commonpath([root, path]) != root:
+            raise ValueError(f"Input '{name}' is outside its allowed directory.")
+        if os.path.splitext(path)[1].lower() not in [ext.lower() for ext in policies[name]["extensions"]]:
+            raise ValueError(f"Input '{name}' has an unsupported file extension.")
+        if not os.path.isfile(path):
+            raise ValueError(f"Input '{name}' file not found.")
+        size = os.path.getsize(path)
+        if not size or size > MAX_FILE_BYTES:
+            raise ValueError(f"Input '{name}' must be non-empty and at most {MAX_FILE_BYTES // (1024 * 1024)} MB.")
+        result.files[name] = path
+    return result
 
 
 def safe_name(value: str) -> str:
@@ -804,14 +902,21 @@ def write_ha_target_state(task_config: dict, result_payload: dict, options: dict
         logger.warning(f"Could not push task result to HA state {target_sensor}: {e}")
 
 
-def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: dict, dry_run: bool = False):
+def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: dict, dry_run: bool = False,
+                 inputs: dict | None = None):
     logger.info(f"--- {'Previewing' if dry_run else 'Executing'} Task: {task_id} ---")
+    call = prepare_task_inputs(task_config, inputs)
 
     metrics = {}
     images = []
     loaded_image_names = []
     loaded_file_names = []
     timeseries_data = ""
+    # Required invocation files are strict: never ask the model after an attachment failed.
+    for key, path in call.files.items():
+        b64_data, mime_type = fetch_binary_file(path)
+        images.append((b64_data, mime_type))
+        loaded_file_names.append(f"{key} ({mime_type})")
 
     entity_map = task_config.get("entities", {})
     if isinstance(entity_map, dict):
@@ -900,6 +1005,9 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
     # Entity, URL and processor values keep precedence over same-named built-ins
     for key, value in builtin_placeholders(local_now(options), options).items():
         metrics.setdefault(key, value)
+    metrics.update(call.variables)
+    if call.files:
+        metrics["input_files"] = call.files.copy()
 
     task_memory = load_memory(task_id)
     recent = [entry.get("text", "") for entry in task_memory[:int(task_config.get("history_limit", 7))] if entry.get("text")]
@@ -942,6 +1050,11 @@ def execute_task(task_id: str, task_config: dict, client: mqtt.Client, options: 
             schema=json_schema,
             attachments=images,
         ))
+        if task_config.get("validate_response"):
+            Draft202012Validator(json_schema).validate(result_payload)
+        result_payload.update(call.variables)
+        if call.files:
+            result_payload["input_files"] = call.files.copy()
         result_payload.setdefault("updated_at", local_now(options).isoformat())
     else:
         if isinstance(raw_data, str):
@@ -1006,7 +1119,8 @@ def task_status(task_id: str) -> dict:
     return dict(TASK_STATUS.get(task_id, {"state": "idle"}))
 
 
-def run_task(task_id: str, task_config: dict, client: mqtt.Client | None, options: dict) -> bool:
+def run_task(task_id: str, task_config: dict, client: mqtt.Client | None, options: dict,
+             inputs: dict | None = None) -> bool:
     """Runs one task with status tracking. Tasks run one at a time, whoever triggers them (MQTT, UI, start-up)."""
     status = TASK_STATUS.setdefault(task_id, {})
     status.update({"state": "queued", "queued_at": local_now(options).isoformat()})
@@ -1014,7 +1128,7 @@ def run_task(task_id: str, task_config: dict, client: mqtt.Client | None, option
         started = time.monotonic()
         status.update({"state": "running", "started_at": local_now(options).isoformat(), "error": None})
         try:
-            outcome = execute_task(task_id, task_config, client, options) or {}
+            outcome = execute_task(task_id, task_config, client, options, inputs=inputs) or {}
             status.update({
                 "state": "ok",
                 "last_prompt": outcome.get("prompt", ""),
@@ -1033,10 +1147,13 @@ def run_task(task_id: str, task_config: dict, client: mqtt.Client | None, option
             })
 
 
-def run_task_async(task_id: str, task_config: dict, client: mqtt.Client | None, options: dict) -> threading.Thread:
+def run_task_async(task_id: str, task_config: dict, client: mqtt.Client | None, options: dict,
+                   inputs: dict | None = None) -> threading.Thread:
     # Off the MQTT network loop: an LLM call can take a minute and would otherwise stall keep-alives
+    task_config, inputs = copy.deepcopy(task_config), copy.deepcopy(inputs)
+    prepare_task_inputs(task_config, inputs)
     TASK_STATUS.setdefault(task_id, {})["state"] = "queued"
-    thread = threading.Thread(target=run_task, args=(task_id, task_config, client, options), name=f"task-{task_id}", daemon=True)
+    thread = threading.Thread(target=run_task, args=(task_id, task_config, client, options, inputs), name=f"task-{task_id}", daemon=True)
     thread.start()
     return thread
 
@@ -1096,7 +1213,17 @@ def on_message(client, userdata, msg):
 
     if target_task:
         if target_task in tasks:
-            run_task_async(target_task, tasks[target_task], client, options)
+            try:
+                inputs = None
+                if payload.startswith(("{", "[")):
+                    if getattr(msg, "retain", False):
+                        raise ValueError("Retained invocation payloads are not allowed.")
+                    inputs = json.loads(payload)
+                run_task_async(target_task, tasks[target_task], client, options, inputs)
+            except (ValueError, OSError) as e:
+                logger.error(f"Rejected invocation for '{target_task}': {e}")
+                TASK_STATUS.setdefault(target_task, {}).update({"state": "error", "error": str(e),
+                                                               "finished_at": local_now(options).isoformat()})
         else:
             logger.warning(f"Requested task '{target_task}' not found in llm_tasks.yaml.")
     else:

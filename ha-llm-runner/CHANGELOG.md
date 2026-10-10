@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.4 (2026-10-10)
+
+### Added
+
+- Automations can now send a different local image or file with each task run, along with values such as its location and filename. For example, a Folder Watcher can send each new camera upload to the same task without changing its saved settings.
+- Tasks specify which folders, file types and values they accept. Missing or invalid required files stop the run before an LLM call, avoiding requests without the intended image.
+- Tasks can optionally check that the LLM answer matches the requested JSON format before saving or publishing it. Values supplied by the automation, such as location and filename, are kept unchanged in the result.
+
 ## 1.4.3 (2026-10-10)
 
 ### Added
