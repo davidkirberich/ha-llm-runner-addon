@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte';
   import { api, ApiError } from './api';
-  import { lineOffset } from './editor';
+  import { applyEdit, indentEdit, lineOffset } from './editor';
 
   let { kind, blocked, active, onbusy, ondirty, onsaved }: {
     kind: 'config' | 'processors';
@@ -138,13 +138,12 @@
   async function keydown(event: KeyboardEvent) {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
       event.preventDefault(); void perform(true);
-    } else if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+    } else if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.metaKey) {
       event.preventDefault();
       if (!editor) return;
-      const start = editor.selectionStart, end = editor.selectionEnd;
-      const indent = kind === 'config' ? '  ' : '    ';
-      text = text.slice(0, start) + indent + text.slice(end);
-      await tick(); editor?.setSelectionRange(start + indent.length, start + indent.length); updateCursor();
+      const edit = indentEdit(text, editor.selectionStart, editor.selectionEnd, kind === 'config' ? '  ' : '    ', event.shiftKey);
+      text = applyEdit(editor, edit);
+      await tick(); editor?.setSelectionRange(edit.selectionStart, edit.selectionEnd); updateCursor();
     }
   }
   $effect(() => { ondirty(dirty); });
@@ -198,7 +197,7 @@
   {:else}
     <p class="muted">Select a processor from the list or create a new one.</p>
   {/if}
-  {#if blocked}<p class="muted">Save or discard other editor changes and wait for running tasks before writing this file.</p>{/if}
+  {#if blocked}<p class="muted">Save or discard the changes in the other editor first.</p>{/if}
   {#each errors as error}
     <div class="banner error" role="alert">
       {#if error.line}<button class="secondary" onclick={() => jump(error.line, error.column)}>Line {error.line}</button>{/if}

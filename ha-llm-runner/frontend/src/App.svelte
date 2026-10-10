@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { api, busy, formatTime } from './api';
   import type { Overview, TaskDetail } from './types';
   import StatusChip from './StatusChip.svelte';
@@ -29,8 +29,9 @@
   let controller: AbortController;
   let timer: ReturnType<typeof setTimeout>;
   let noticeTimer: ReturnType<typeof setTimeout>;
-  let refreshing = false;
-  let refreshAgain = false;
+  let refreshPromise: Promise<void> | null = null;
+  let followUpRefresh: Promise<void> | null = null;
+  let detailAnchor = $state<HTMLElement | null>(null);
 
   function report(reason: unknown) {
     if (!controller.signal.aborted) error = reason instanceof Error ? reason.message : String(reason);
@@ -57,48 +58,67 @@
     if (selected === id && request === detailRequest) detail = value;
   }
 
-  async function refresh() {
-    if (refreshing) {
-      refreshAgain = true;
-      return;
+  // Resolves only after a refresh that started after this call has finished.
+  function refresh(): Promise<void> {
+    if (refreshPromise) {
+      followUpRefresh ??= refreshPromise.then(() => {
+        followUpRefresh = null;
+        return refresh();
+      });
+      return followUpRefresh;
     }
+    refreshPromise = loadOverview().finally(() => { refreshPromise = null; });
+    return refreshPromise;
+  }
+
+  async function loadOverview() {
     clearTimeout(timer);
-    refreshing = true;
+    const current = selected;
     try {
       overview = await api<Overview>('GET', 'overview', controller.signal);
-      if (selected && overview.tasks.some((task) => task.id === selected)) {
-        await loadDetail(selected);
-      } else {
-        selected = null;
-        detail = null;
+      if (selected === current) {
+        if (current && overview.tasks.some((task) => task.id === current)) {
+          await loadDetail(current);
+        } else {
+          selected = null;
+          detail = null;
+        }
       }
       error = '';
     } catch (reason) {
       report(reason);
     } finally {
-      refreshing = false;
       if (!controller.signal.aborted) {
-        const delay = refreshAgain ? 0 : overview?.tasks.some((task) => busy(task.status.state)) ? 2000 : 15000;
-        refreshAgain = false;
+        const delay = overview?.tasks.some((task) => busy(task.status.state)) ? 2000 : 15000;
         timer = setTimeout(refresh, delay);
       }
     }
   }
 
+  async function revealDetails() {
+    await tick();
+    detailAnchor?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
   async function select(id: string) {
-    if (selected === id) return;
+    if (selected === id) { void revealDetails(); return; }
     if (settingsDirty && !confirm('Discard your unsaved changes of the settings?')) return;
     settingsDirty = false;
     openConfig = false;
     selected = id;
     detail = null;
+    void revealDetails();
     try { await loadDetail(id); } catch (reason) { report(reason); }
+  }
+  function rowClick(event: MouseEvent, id: string) {
+    if ((event.target as HTMLElement).closest('button, a, input')) return;
+    void select(id);
   }
 
   const drafts = $derived(settingsDirty || configDirty || processorDirty);
-  const fileBusy = $derived(pending || configWorking || processorWorking || (overview?.tasks.some((task) => busy(task.status.state)) ?? false));
+  const fileBusy = $derived(pending || configWorking || processorWorking);
   async function createTask() {
-    if (drafts || fileBusy) { error = 'Save or discard editor changes and wait for running tasks before creating a task.'; return; }
+    if (drafts || fileBusy) { error = 'Save or discard editor changes before creating a task.'; return; }
     const id = newTaskId.trim();
     if (!id) return;
     pending = true;
@@ -108,6 +128,7 @@
       selected = id; detail = null; openConfig = true; switchTab('tasks');
       await refresh();
       notify(`Task '${id}' created`);
+      void revealDetails();
     } catch (reason) { report(reason); }
     finally { pending = false; }
   }
@@ -126,6 +147,7 @@
 
   async function run(id?: string) {
     if (pending || configWorking || processorWorking) return;
+    if (!id && !confirm(`Run all ${overview?.tasks.length ?? 0} tasks now? Tasks with a prompt call the LLM.`)) return;
     pending = true;
     try {
       if (id) {
@@ -219,7 +241,9 @@
           <thead><tr><th>Task</th><th>Status</th><th>Last run</th><th>Memory</th><th>Actions</th></tr></thead>
           <tbody>
             {#each overview.tasks as task (task.id)}
-              <tr class:selected={selected === task.id}>
+              <!-- The Details button is the keyboard-accessible equivalent of a row click. -->
+              <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+              <tr class="clickable" class:selected={selected === task.id} onclick={(event) => rowClick(event, task.id)}>
                 <td>
                   <strong class="mono">{task.id}</strong>
                   <div class="muted">
@@ -246,6 +270,7 @@
       <p class="muted">Loading tasks...</p>
     {/if}
   </section>
+  <div class="detail-anchor" bind:this={detailAnchor}></div>
   {#if detail}
     {#key detail.id}
       <TaskDetails {detail} {pending} fileBusy={fileBusy || configDirty || processorDirty}
@@ -259,7 +284,7 @@
   <div hidden={tab !== 'config'}>
     {#if configOpened}
       <FileEditor kind="config" active={tab === 'config'}
-        blocked={pending || processorWorking || settingsDirty || processorDirty || (overview?.tasks.some((task) => busy(task.status.state)) ?? false)}
+        blocked={pending || processorWorking || settingsDirty || processorDirty}
         onbusy={(value) => configWorking = value}
         ondirty={(value) => configDirty = value} onsaved={() => { void refresh(); }} />
     {/if}
@@ -267,7 +292,7 @@
   <div hidden={tab !== 'processors'}>
     {#if processorsOpened}
       <FileEditor kind="processors" active={tab === 'processors'}
-        blocked={pending || configWorking || settingsDirty || configDirty || (overview?.tasks.some((task) => busy(task.status.state)) ?? false)}
+        blocked={pending || configWorking || settingsDirty || configDirty}
         onbusy={(value) => processorWorking = value}
         ondirty={(value) => processorDirty = value} onsaved={() => { void refresh(); }} />
     {/if}

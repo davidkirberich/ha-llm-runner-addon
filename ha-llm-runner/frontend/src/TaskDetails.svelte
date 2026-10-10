@@ -27,7 +27,8 @@
     <h2 class="mono">{detail.id}</h2>
     <StatusChip status={detail.status} />
     <span class="grow"></span>
-    <button class="danger" disabled={fileBusy} onclick={() => onremove(detail.id)}>Remove</button>
+    <button class="danger" disabled={fileBusy || busy(detail.status.state)}
+      title={busy(detail.status.state) ? 'Wait until this task has finished' : ''} onclick={() => onremove(detail.id)}>Remove</button>
     <button class="secondary" onclick={() => onaudit(detail.id)}>Audit archives</button>
     <button disabled={pending || busy(detail.status.state)} onclick={() => onrun(detail.id)}>Run now</button>
   </div>

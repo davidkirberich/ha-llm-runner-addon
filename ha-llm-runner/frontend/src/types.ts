@@ -1,6 +1,8 @@
 export interface TaskStatus {
   state?: string;
   error?: string;
+  queued_at?: string;
+  started_at?: string;
   finished_at?: string;
   duration?: number;
   last_result?: unknown;

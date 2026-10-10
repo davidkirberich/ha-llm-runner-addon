@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte';
   import { api, ApiError } from './api';
-  import { defaultAlias, insertIndent, lineOffset, openMoreInfo } from './editor';
+  import { applyEdit, defaultAlias, indentEdit, lineOffset, openMoreInfo } from './editor';
   import type { EntityRow, EntityRows, Preview, SearchEntity, YamlCheck } from './types';
   import ResultView from './ResultView.svelte';
 
@@ -104,12 +104,12 @@
     editor.scrollTop = Math.max(0, (line - 5) * (parseFloat(getComputedStyle(editor).lineHeight) || 18));
   }
   async function keydown(event: KeyboardEvent) {
-    if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+    if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.metaKey) {
       event.preventDefault();
-      const value = insertIndent(text, editor.selectionStart, editor.selectionEnd);
-      text = value.text;
+      const edit = indentEdit(text, editor.selectionStart, editor.selectionEnd, '  ', event.shiftKey);
+      text = applyEdit(editor, edit);
       await tick();
-      editor.setSelectionRange(value.cursor, value.cursor);
+      editor.setSelectionRange(edit.selectionStart, edit.selectionEnd);
     } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
       event.preventDefault();
       void save();
@@ -300,6 +300,9 @@
     {saving ? 'Saving...' : dirty ? 'Save *' : 'Save'}
   </button>
 </div>
+{#if dirty && fileBusy && !saving}
+  <p class="muted">Save is paused while another editor has unsaved changes or an action is running.</p>
+{/if}
 <p class="muted">The whole task, including entities, files, URLs and comments. Ctrl+S saves; Ctrl+Enter previews
   this unsaved text. Preview writes no memory, audit, target sensor or MQTT update.</p>
 <textarea class="code" aria-label="Task YAML" wrap="soft" bind:this={editor} bind:value={text} onkeydown={keydown}></textarea>

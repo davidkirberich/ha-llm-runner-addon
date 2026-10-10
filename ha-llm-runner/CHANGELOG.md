@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Configuration files and task settings can now be saved while tasks are running. Only removing a task that is currently running remains blocked.
+- "Run all tasks" asks for confirmation first.
+- Running and queued tasks show a live elapsed time in their status chip.
+- Clicking a task row opens its details and scrolls them into view.
+
+### Fixed
+
+- Tab and Shift+Tab in the editors now indent or outdent all selected lines instead of replacing the selection, and Ctrl+Z can undo them.
+- When the add-on is restarting, the UI shows a clear message instead of a JSON parse error.
+- A new task could briefly disappear from the selection because of an outdated overview refresh.
+
 ## 1.5.0 (2026-10-10)
 
 ### Added

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api, busy, formatTime } from './api';
+import { api, busy, elapsed, formatTime } from './api';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -37,8 +37,23 @@ describe('API client', () => {
 
   it('does not turn invalid JSON into a successful response', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('not JSON')));
-    await expect(api('GET', 'overview')).rejects.toThrow();
+    await expect(api('GET', 'overview')).rejects.toThrow('unexpected response');
   });
+
+  it('explains non-JSON gateway errors', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<html>502 Bad Gateway</html>', { status: 502 })));
+    await expect(api('GET', 'overview')).rejects.toThrow('not reachable');
+  });
+});
+
+it('formats elapsed time', () => {
+  const now = Date.parse('2024-01-01T12:00:00Z');
+  expect(elapsed('2024-01-01T11:59:18Z', now)).toBe('42s');
+  expect(elapsed('2024-01-01T11:56:55Z', now)).toBe('3m 05s');
+  expect(elapsed('2024-01-01T10:58:00Z', now)).toBe('1h 02m');
+  expect(elapsed('2024-01-01T12:00:05Z', now)).toBe('0s');
+  expect(elapsed('invalid', now)).toBe('');
+  expect(elapsed(undefined, now)).toBe('');
 });
 
 it('recognizes running and queued tasks', () => {
