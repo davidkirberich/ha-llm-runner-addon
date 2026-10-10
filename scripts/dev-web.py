@@ -1,5 +1,6 @@
 """Starts the add-on's web interface on this computer with invented sample data.
 
+    # First run npm ci and npm run build in ha-llm-runner/frontend
     python scripts/dev-web.py            # then open http://localhost:8099
     python scripts/dev-web.py --port 8199
 
@@ -8,7 +9,7 @@ computer is blocked, Run only simulates a task (dummy answer after two seconds) 
 Config tab of a task show invented entities.
 
 The sample data in .dev-config/ (ignored by git) is recreated on every start, so changes made in the web
-interface are gone after a restart. web.py and web/index.html are loaded fresh on every start as well.
+interface are gone after a restart. web.py and the built Svelte assets are served from the working tree.
 """
 import argparse
 import base64

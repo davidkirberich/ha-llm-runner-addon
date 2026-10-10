@@ -500,6 +500,7 @@ class WebApp:
         self.routes = [
             ("GET", r"", self.index),
             ("GET", r"index\.html", self.index),
+            ("GET", r"assets/(?P<name>[A-Za-z0-9_-]+\.(?:js|css))", self.frontend_asset),
             ("GET", r"api/overview", self.overview),
             ("POST", r"api/run-all", self.run_all),
             ("POST", r"api/tasks", self.create_task),
@@ -551,8 +552,18 @@ class WebApp:
             raise ApiError(404, f"Task '{task_id}' not found in llm_tasks.yaml.")
         return tasks[task_id]
 
-    def index(self, **_):
-        return ("file", os.path.join(STATIC_DIR, "index.html"), "text/html; charset=utf-8")
+    def index(self, query=None, **_):
+        path = os.path.join(STATIC_DIR, "svelte", "index.html")
+        if not os.path.isfile(path):
+            raise ApiError(503, "The Svelte interface has not been built. Run npm ci and npm run build in frontend.")
+        return ("file", path, "text/html; charset=utf-8")
+
+    def frontend_asset(self, name, **_):
+        path = os.path.join(STATIC_DIR, "svelte", "assets", name)
+        if not os.path.isfile(path):
+            raise ApiError(404, "Frontend asset not found.")
+        mime = "text/javascript" if name.endswith(".js") else "text/css"
+        return ("file", path, mime + "; charset=utf-8")
 
     def overview(self, **_):
         runner = self.runner

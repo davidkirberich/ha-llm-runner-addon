@@ -1,0 +1,4 @@
+frontend/node_modules
+web/svelte
+__pycache__
+*.pyc

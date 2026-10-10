@@ -221,3 +221,7 @@ __marimo__/
 
 # Local web UI testing (scripts/dev-web.py)
 .dev-config/
+
+# Svelte frontend dependencies and generated build
+node_modules/
+ha-llm-runner/web/svelte/

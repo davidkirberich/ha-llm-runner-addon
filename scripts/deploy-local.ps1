@@ -93,7 +93,7 @@ echo "Local add-on removed."
 $archive = Join-Path ([IO.Path]::GetTempPath()) "ha_llm_runner_deploy.tar.gz"
 try {
     Write-Host "Packing $source ..."
-    tar --exclude=__pycache__ --exclude=.pytest_cache --exclude="*.pyc" -czf $archive -C $source .
+    tar --exclude=__pycache__ --exclude=.pytest_cache --exclude="*.pyc" --exclude=node_modules --exclude="./web/svelte" -czf $archive -C $source .
     if ($LASTEXITCODE -ne 0) { throw "tar failed." }
 
     Write-Host "Uploading ..."

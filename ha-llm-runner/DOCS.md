@@ -41,6 +41,16 @@ Changes to `llm_tasks.yaml` are picked up on the next run. When you save the fil
 
 ## Web interface
 
+### Frontend development
+
+The web interface uses Svelte 5 and TypeScript for all tabs: Tasks (including New/Remove, Details, Memory, Config and Preview), llm_tasks.yaml, Processors and Audit. The Python REST API is unchanged. Polling preserves unsaved YAML and cursor position; task changes and leaving the page warn about unsaved changes. Preview errors include traceback and results are marked when the editor has changed since the request. Editors keep drafts when switching tabs, and changes made during saving remain unsaved. Task creation and conflicting file writes are blocked while another editor has unsaved changes.
+
+Frontend sources are in `frontend/`. With Node.js 22.12+ installed, run `npm ci`, then `npm run build` there. The build writes static assets to `web/svelte/`; the add-on's Docker build performs this automatically in a separate Node build stage. Node is not included in the runtime image. Unbuilt development checkouts return an explicit HTTP 503 with build instructions. The former hand-written JavaScript UI has been removed.
+
+For local development, start `scripts/dev-web.py --port 8199` from the repository root (sample data only), then run `npm run dev` in `frontend/`. Vite proxies API calls to the sample backend. Use `npm run check` and `npm test` to validate the frontend. To test the production build, open `http://localhost:8199/`. Asset and API URLs remain relative for Home Assistant Ingress. The old `?ui=svelte` URL still serves the same interface for existing bookmarks.
+
+### Features
+
 The add-on adds **LLM Runner** to the Home Assistant sidebar. It shows:
 
 - **Tasks**: every task by its ID from `llm_tasks.yaml`, with status, duration and errors of the last run. Every task can be run from here, also without an MQTT connection. **New** asks for a task ID, appends a task with only a short example `prompt` to `llm_tasks.yaml` and opens its **Config** tab. **Details** opens the task below the list with three tabs:

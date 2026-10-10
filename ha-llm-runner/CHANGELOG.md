@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Complete Svelte 5 / TypeScript web interface: Tasks with New/Remove, run actions, results, prompts and memory; full configuration editing; Processor New/Validate/Save/Delete; and Audit filtering, viewing, attachments, downloads and deletion.
+- Reproducible frontend build and checks with Vite; static assets are compiled in a separate Docker build stage without adding Node to the runtime.
+- Svelte task Config tab: whole-task YAML editor, live entity table and search with Add/Remove, syntax validation, Save/Discard, Ctrl+S and unsaved Preview via Ctrl+Enter. Drafts survive polling; stale entity edits cannot overwrite newer text, and edits made during saving remain unsaved.
+
+### Changed
+
+- Svelte is now the default and only web interface; the former hand-written DOM UI is removed. The Python API remains unchanged. Development checkouts must build the frontend first; the Docker image builds it automatically.
+- Audit uses dependent Task and Call dropdowns instead of archive buttons. Calls are sorted newest first and limited to the latest 50 per task; changing tasks clears the selected call and its contents.
+- New task and processor names are entered directly in the interface rather than native browser prompt dialogs.
+- Processor selection uses a left sidebar on desktop and stacks above the editor on small screens. File editor line/column indicators appear in the top toolbar.
+- Task action success messages use a green background and disappear after five seconds or when switching main tabs; they can still be dismissed manually.
+- File validation results appear beside Validate, with errors and warnings above the editor. Processor validation again describes the compilation, process(df, config) and import checks; configuration validation shows the task count.
+
 ## 1.4.2 (2026-10-10)
 
 ### Added

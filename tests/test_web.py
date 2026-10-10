@@ -29,12 +29,16 @@ def write_tasks(storage, text):
     storage["TASKS_CONFIG_PATH"].write_text(text, encoding="utf-8")
 
 
-def test_index_is_served_with_relative_api_urls(server):
+def test_index_is_served_with_relative_api_urls(server, monkeypatch, tmp_path):
+    monkeypatch.setattr(web, "STATIC_DIR", str(tmp_path))
+    build = tmp_path / "svelte"
+    build.mkdir()
+    (build / "index.html").write_text('<script src="./assets/index-test.js"></script>', encoding="utf-8")
     response = requests.get(server, timeout=5)
 
     assert response.status_code == 200
     assert response.headers["Content-Type"].startswith("text/html")
-    assert 'api("GET", "api/overview")' in response.text
+    assert './assets/index-test.js' in response.text
     assert '"/api/' not in response.text
 
 
@@ -42,6 +46,25 @@ def test_only_ingress_proxy_and_localhost_may_connect(server, monkeypatch):
     monkeypatch.setattr(web, "ALLOWED_CLIENTS", {"172.30.32.2"})
 
     assert requests.get(server + "api/overview", timeout=5).status_code == 403
+
+
+def test_svelte_interface_is_default_and_serves_only_build_assets(server, monkeypatch, tmp_path):
+    monkeypatch.setattr(web, "STATIC_DIR", str(tmp_path))
+    (tmp_path / "index.html").write_text("legacy", encoding="utf-8")
+    assert requests.get(server, timeout=5).status_code == 503
+    assert requests.get(server + "?ui=svelte", timeout=5).status_code == 503
+    assets = tmp_path / "svelte" / "assets"
+    assets.mkdir(parents=True)
+    (assets.parent / "index.html").write_text("svelte", encoding="utf-8")
+    (assets / "index-test.js").write_text("export {};", encoding="utf-8")
+    (assets / "index-test.css").write_text("body {}", encoding="utf-8")
+    assert requests.get(server, timeout=5).text == "svelte"
+    assert requests.get(server + "?ui=svelte", timeout=5).text == "svelte"
+    js = requests.get(server + "assets/index-test.js", timeout=5)
+    assert js.status_code == 200 and js.headers["Content-Type"].startswith("text/javascript")
+    assert requests.get(server + "assets/index-test.css", timeout=5).status_code == 200
+    assert requests.get(server + "assets/missing.js", timeout=5).status_code == 404
+    assert requests.get(server + "assets/%2e%2e%2findex.html", timeout=5).status_code == 404
 
 
 def test_changes_require_json_content_type(server, storage):
